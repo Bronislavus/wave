@@ -49,7 +49,7 @@ CMAKE_OSX_SYSROOT="${CMAKE_OSX_SYSROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
 BUILD_JOBS="${BUILD_JOBS:-8}"
 
 TARGET="WaveEmulation"
-BUNDLE_NAME="Wave Emulation Sample"
+BUNDLE_NAME="Wave Emulation"
 PRODUCT_NAME="Wave Emulation"
 PRODUCT_IDENTIFIER="${PRODUCT_IDENTIFIER:-com.djw.waveemulation}"
 ARTEFACT_DIR="$BUILD_DIR/${TARGET}_artefacts/$BUILD_CONFIG"

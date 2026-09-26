@@ -205,7 +205,7 @@ juce_add_plugin(WaveEmulation
     PLUGIN_MANUFACTURER_CODE Djwh
     PLUGIN_CODE WvSm
     FORMATS AU VST3 AAX Standalone
-    PRODUCT_NAME "Wave Emulation Sample"
+    PRODUCT_NAME "Wave Emulation"
     DESCRIPTION "Firmware-aware Waldorf Wave hardware modelling research sample"
     AAX_CATEGORY AAX_ePlugInCategory_SWGenerators
     IS_SYNTH TRUE
