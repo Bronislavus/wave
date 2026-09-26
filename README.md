@@ -20,12 +20,24 @@ The editor embeds `media/WaldorfWaveUI_NOLOGO.svg` as its 2338 x 1042 source art
 
 ## Installing the macOS release
 
+Builds target macOS Ventura 13.0 or later on Apple Silicon and Intel Macs.
+Plugin use also requires a host compatible with your macOS version. CPU and RAM
+minimums have not yet been established by testing. Earlier release binaries may
+have a higher macOS minimum; they must be rebuilt to support Ventura.
+
 Run the installer inside the release DMG. Starting with version 0.1.2, it installs
 **Wave Emulation.app** in `/Applications` as well as the AU, VST3, and AAX plugins.
 Quit any older standalone instance, then launch `/Applications/Wave Emulation.app`.
 Older development copies named **Wave Emulation Sample.app** are separate files
 and are not updated by this installer. Versions 0.1.0 and 0.1.1 installed only
 the plugins, so they did not update a standalone app you already had open.
+
+[Version 0.1.6](https://github.com/mo0kid/wave/releases/tag/v0.1.6) targets
+macOS Ventura 13.0 and later in universal Apple Silicon/Intel builds of the
+standalone app, AU, VST3 and AAX plugins. The installer checks the minimum OS,
+and packaging verifies both architectures target the expected macOS version.
+The binaries and automated tests have been checked on the development Mac;
+runtime testing on Ventura is still pending.
 
 [Version 0.1.5](https://github.com/mo0kid/wave/releases/tag/v0.1.5) synchronizes
 host preset save/restore with rendering so firmware reload cannot replace shared

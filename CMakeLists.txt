@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(WaveEmulationSample VERSION 0.1.5 LANGUAGES C CXX)
+# Set this before project() so compiler checks and dependencies use Ventura too.
+if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING
+        "Minimum supported macOS version" FORCE)
+endif()
+
+project(WaveEmulationSample VERSION 0.1.6 LANGUAGES C CXX)
 
 include(FetchContent)
 

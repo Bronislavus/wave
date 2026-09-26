@@ -8,7 +8,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure without private data or signing
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DWAVE_EMBED_PRIVATE_ASSETS=OFF -DWAVE_SIGN_RELEASE_ARTIFACTS=OFF
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release '-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64' -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DWAVE_EMBED_PRIVATE_ASSETS=OFF -DWAVE_SIGN_RELEASE_ARTIFACTS=OFF
       - name: Build
         run: cmake --build build --parallel 3
       - name: Test

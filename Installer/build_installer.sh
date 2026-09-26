@@ -7,7 +7,7 @@
 # are stored in this script.
 #
 # Common overrides:
-#   VERSION=0.1.5
+#   VERSION=0.1.6
 #   BUILD_JOBS=8
 #   SKIP_PLUGIN_BUILD=1
 #   SKIP_WRAP=1
@@ -45,11 +45,12 @@ PACKAGES_DIR="$WORK_DIR/packages"
 RESOURCES_DIR="$WORK_DIR/resources"
 DMG_STAGING_DIR="$WORK_DIR/dmg"
 
-VERSION="${VERSION:-0.1.5}"
+VERSION="${VERSION:-0.1.6}"
 TEAM_ID="${TEAM_ID:-}"
 BUILD_CONFIG="${BUILD_CONFIG:-Release}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-$BUILD_CONFIG}"
 CMAKE_OSX_ARCHITECTURES="${CMAKE_OSX_ARCHITECTURES:-arm64;x86_64}"
+CMAKE_OSX_DEPLOYMENT_TARGET="${CMAKE_OSX_DEPLOYMENT_TARGET:-13.0}"
 CMAKE_OSX_SYSROOT="${CMAKE_OSX_SYSROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
 BUILD_JOBS="${BUILD_JOBS:-8}"
 
@@ -143,6 +144,12 @@ validate_bundle() {
       echo "Error: $bundle is missing $required (found: $architectures)." >&2
       exit 1
     fi
+    local minimum_os
+    minimum_os="$(xcrun vtool -arch "$required" -show-build "$binary" | awk '$1 == "minos" { print $2 }')"
+    if [ "$minimum_os" != "$CMAKE_OSX_DEPLOYMENT_TARGET" ]; then
+      echo "Error: $bundle ($required) targets macOS $minimum_os; expected $CMAKE_OSX_DEPLOYMENT_TARGET. Rebuild before packaging." >&2
+      exit 1
+    fi
   done
 }
 
@@ -210,6 +217,7 @@ build_plugins() {
   cmake -S "$PROJECT_ROOT" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE" \
     -DCMAKE_OSX_ARCHITECTURES="$CMAKE_OSX_ARCHITECTURES" \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET="$CMAKE_OSX_DEPLOYMENT_TARGET" \
     -DCMAKE_OSX_SYSROOT="$CMAKE_OSX_SYSROOT" \
     -DWAVE_SIGN_RELEASE_ARTIFACTS=OFF \
     -DWAVE_EMBED_PRIVATE_ASSETS=OFF
@@ -344,6 +352,7 @@ WELCOME
   <organization>com.djw</organization>
   <welcome file="welcome.html"/>
   <options customize="allow" require-scripts="false" hostArchitectures="arm64,x86_64"/>
+  <volume-check><allowed-os-versions><os-version min="$CMAKE_OSX_DEPLOYMENT_TARGET"/></allowed-os-versions></volume-check>
   <choices-outline>
     <line choice="standalone"/><line choice="au"/><line choice="vst3"/><line choice="aax"/>
   </choices-outline>
