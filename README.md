@@ -89,6 +89,9 @@ with the Wave product WCGUID, Developer ID signing, notarization and stapling:
 ```
 
 Set `TEAM_ID`, `PACE_ACCOUNT`, and `PACE_WCGUID` for your release accounts.
+You can store shell assignments in `Installer/.env.local`, which is loaded
+automatically and ignored by Git. Use `${VARIABLE:-default}` assignments to
+preserve command-line environment overrides. Keep passwords in the keychain.
 The script uses the `wave-notary` keychain profile by default and accepts
 environment overrides documented at its top. For a local packaging check that
 does not contact PACE or Apple, use `SKIP_WRAP=1 SKIP_SIGN=1

@@ -32,6 +32,11 @@ is_truthy() {
 }
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# Local account defaults stay outside version control. Environment overrides
+# can be preserved by using ${VARIABLE:-default} assignments in this file.
+if [ -f "$PROJECT_ROOT/Installer/.env.local" ]; then
+  source "$PROJECT_ROOT/Installer/.env.local"
+fi
 BUILD_DIR="$PROJECT_ROOT/build"
 INSTALLER_DIR="$PROJECT_ROOT/Installer"
 WORK_DIR="$INSTALLER_DIR/.release-work"
