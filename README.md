@@ -27,18 +27,18 @@ Older development copies named **Wave Emulation Sample.app** are separate files
 and are not updated by this installer. Versions 0.1.0 and 0.1.1 installed only
 the plugins, so they did not update a standalone app you already had open.
 
-Version 0.1.3 has been withdrawn after a firmware failure during Logic preset
-recall. Version 0.1.5 is a local validation candidate: it synchronizes host preset
-save/restore with the same instance's rendering so firmware reload cannot replace
-shared memory while the emulated CPUs are using it. Publication is pending the
-project owner's DAW validation and explicit approval.
+[Version 0.1.5](https://github.com/mo0kid/wave/releases/tag/v0.1.5) synchronizes
+host preset save/restore with rendering so firmware reload cannot replace shared
+memory while the emulated CPUs are using it. It also retires leftover Edit-page
++/- events when selecting a Performance, preventing delayed presses or retries
+from restarting patch stepping after release. Performance-page +/- remains one
+patch per click. Preset save/recall and patch stepping were validated by the
+project owner in Logic Pro before publication.
 
-The candidate also retires leftover Edit-page +/- events when selecting a
-Performance, and prevents delayed presses or retries from restarting patch
-stepping after release. Performance-page +/- remains one patch per click.
-
-The candidate retains per-thread firmware-emulator state for separate instances
-and connects voice-card workers to the host's macOS audio workgroup when provided.
+The release remembers the firmware folder for new instances, keeps separate
+instances' firmware-emulator execution state independent, and connects voice-card
+workers to the host's macOS audio workgroup when provided. Version 0.1.3 remains
+withdrawn; users of that version should update to 0.1.5.
 
 ### CPU load in Logic Pro
 
