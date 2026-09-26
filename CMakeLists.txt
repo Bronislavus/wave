@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(WaveEmulationSample VERSION 0.1.0 LANGUAGES C CXX)
+project(WaveEmulationSample VERSION 0.1.1 LANGUAGES C CXX)
 
 include(FetchContent)
 
