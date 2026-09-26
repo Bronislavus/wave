@@ -1,4 +1,5 @@
 #include "PluginProcessor.h"
+#include "PanelWiring.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -41,6 +42,76 @@ int main(int argc, char** argv)
             };
             processor->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
             const auto referenceScreen = renderAndCheck();
+            if (std::getenv("WAVE_TEST_PATCH_STEPS") != nullptr)
+            {
+                auto render = [&](int blocks)
+                {
+                    juce::AudioBuffer<float> audio(2, 512);
+                    juce::MidiBuffer midi;
+                    for (int b = 0; b < blocks; ++b)
+                    {
+                        audio.clear();
+                        processor->processBlock(audio, midi);
+                    }
+                };
+                auto edge = [&](int code, bool down)
+                {
+                    processor->setPanelButton(wave::panel::matrixIndexForDiagnosticCode(code), down);
+                };
+                for (const auto delay : { 0, 1, 2, 3, 8, 16, 32 })
+                {
+                    processor->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+                    render(64);
+                    edge(60, true); render(8); edge(60, false); render(32);
+                    edge(72, true); edge(72, false); render(delay);
+                    processor->setCurrentProgram(10);
+                    edge(72, true); render(1); edge(72, false);
+                    render(768);
+                    const auto selected = processor->getMasterFirmwareRuntime().currentPerformanceId();
+                    std::cout << "Edit-to-performance delay " << delay << " selected "
+                              << selected.value_or(-1) << std::endl;
+                    if (!selected.has_value() || *selected != 11)
+                        throw std::runtime_error("Released Plus changed patches after leaving Edit");
+                }
+                // A press already in the controller queue can arrive after
+                // the user has selected Performance and released the mouse.
+                processor->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+                render(64);
+                auto& firmware = const_cast<wave::firmware::MasterFirmwareRuntime&>(
+                    processor->getMasterFirmwareRuntime());
+                firmware.pushPanelEvent(0x80u, 72u, 1u);
+                edge(72, true); edge(72, false);
+                render(768);
+                const auto lateSelected = firmware.currentPerformanceId();
+                std::cout << "Late press selected " << lateSelected.value_or(-1) << std::endl;
+                if (!lateSelected.has_value() || *lateSelected != 1)
+                    throw std::runtime_error("A late released press changed the selected patch");
+                processor->setCurrentProgram(0); render(64);
+                for (int click = 0; click < 12; ++click)
+                {
+                    edge(72, true); edge(72, false);
+                    render(click % 3);
+                }
+                render(768);
+                if (firmware.currentPerformanceId() != std::optional<int>(12))
+                    throw std::runtime_error("Rapid Plus clicks were lost or repeated");
+                for (int click = 0; click < 5; ++click)
+                {
+                    edge(69, true); edge(69, false); render(2);
+                }
+                render(768);
+                if (firmware.currentPerformanceId() != std::optional<int>(7))
+                    throw std::runtime_error("Rapid Minus clicks were lost or repeated");
+                edge(69, true); render(768); edge(69, false); render(768);
+                if (firmware.currentPerformanceId() != std::optional<int>(6))
+                    throw std::runtime_error("A held Minus button repeated after release");
+                firmware.pushPanelEvent(0x80u, 69u, 1u);
+                render(768);
+                if (firmware.currentPerformanceId() != std::optional<int>(6))
+                    throw std::runtime_error("An idle Performance page accepted a stale Minus press");
+                std::cout << "Patch step transitions passed\n";
+                return 0;
+            }
             std::atomic<unsigned> renderedBlocks { 0 };
             std::jthread concurrentRender([&](std::stop_token stop)
             {

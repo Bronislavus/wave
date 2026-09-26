@@ -944,6 +944,7 @@ void WaveEmulationAudioProcessor::setCurrentProgram(int index)
                                             std::memory_order_release);
     panelSelectedMode.store(39, std::memory_order_release);
     panelSelectedEdit.store(-1, std::memory_order_release);
+    cancelPanelStepButtonEvents.store(true, std::memory_order_release);
     currentProgram = bounded;
     parameters.state.setProperty("factoryProgram", bounded, nullptr);
     applyFactoryProgram(bounded, true);
@@ -2201,14 +2202,22 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
             }
         }
     }
-    if (cancelPanelStepButtonEvents.exchange(false,
-                                             std::memory_order_acq_rel))
+    const auto cancelStepEvents = cancelPanelStepButtonEvents.exchange(
+        false, std::memory_order_acq_rel);
+    const auto performanceOwnsStepping
+        = panelSelectedMode.load(std::memory_order_acquire) == 39
+          && panelSelectedEdit.load(std::memory_order_acquire) < 0;
+    if (cancelStepEvents || performanceOwnsStepping)
     {
         // +/- is contextual. An edit page can leave a serial press waiting
         // while the user returns to Performance; if it is consumed after the
         // page change, OS 1.700 treats it as a held patch selector. Retire the
         // complete old transaction, including a press already queued in the
         // genuine controller ring, before Performance owns these serials.
+        // Performance clicks use exact program requests, so no +/- serial
+        // hold belongs on that page. Repeat this on the render thread: a
+        // paused firmware instruction can finish installing a stale latch
+        // after a one-off clear, and an old edit retry can arrive later.
         pendingPanelStepButtonEvents.store(0, std::memory_order_release);
         queuedPanelStepButtonEvents = 0;
         activePanelStepButtonDiagnosticCode = -1;
@@ -2219,8 +2228,9 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
                 = wave::panel::matrixIndexForDiagnosticCode(diagnosticCode);
             if (matrix >= 0)
             {
-                panelButtonDown[static_cast<size_t>(matrix)].store(
-                    false, std::memory_order_release);
+                if (cancelStepEvents)
+                    panelButtonDown[static_cast<size_t>(matrix)].store(
+                        false, std::memory_order_release);
                 masterFirmware.setPanelButton(matrix, false);
             }
             // Remove an edge which is still in the genuine controller ring;
@@ -3945,9 +3955,8 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
             // change several seconds later. Clear any preceding action and
             // request the exact adjacent Performance through the existing
             // firmware program-selection transaction.
-            masterFirmware.setPanelButton(buttonId, false);
-            masterFirmware.releasePanelEventLatch(69);
-            masterFirmware.releasePanelEventLatch(72);
+            // Queue cleanup with the program request. The UI thread must
+            // not write firmware repeat state while its CPU is executing.
             stepFactoryPerformance(diagnosticCode == 69 ? -1 : 1);
         }
         else
