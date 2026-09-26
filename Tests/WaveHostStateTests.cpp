@@ -10,6 +10,71 @@ int main(int argc, char** argv)
     juce::ScopedJuceInitialiser_GUI initialiseJuce;
     try
     {
+        if (const auto* stateFile = std::getenv("WAVE_HOST_STATE_FILE"))
+        {
+            // Optional local fixture: raw jucePluginState from an AU preset.
+            // User presets and firmware stay outside the source repository.
+            juce::TemporaryFile isolatedPreference(".txt");
+            auto processor = std::make_unique<WaveEmulationAudioProcessor>(isolatedPreference.getFile());
+            juce::MemoryBlock state;
+            if (!juce::File(stateFile).loadFileAsData(state))
+                throw std::runtime_error("Unable to read host state fixture");
+            processor->prepareToPlay(96000.0, 512);
+            const auto renderAndCheck = [&]
+            {
+                juce::AudioBuffer<float> audio(2, 512);
+                juce::MidiBuffer midi;
+                for (int block = 0; block < 1000; ++block)
+                {
+                    const juce::ScopedLock lock(processor->getCallbackLock());
+                    audio.clear();
+                    processor->processBlock(audio, midi);
+                }
+                const juce::ScopedLock lock(processor->getCallbackLock());
+                if (!processor->getMasterFirmwareRuntime().completedVoiceBoardLoaderHandoff()
+                    || processor->getMasterFirmwareRuntime().unmappedReadCount() != 0)
+                    throw std::runtime_error("Recalled master firmware is not operational");
+                for (int board = 0; board < 3; ++board)
+                    if (!processor->getVoiceFirmwareRuntime(board).reachedServiceLoop())
+                        throw std::runtime_error("Recalled voice firmware left its service loop");
+                return processor->getMasterFirmwareRuntime().lcdVideoSnapshot();
+            };
+            processor->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+            const auto referenceScreen = renderAndCheck();
+            std::atomic<unsigned> renderedBlocks { 0 };
+            std::jthread concurrentRender([&](std::stop_token stop)
+            {
+                juce::AudioBuffer<float> audio(2, 512);
+                juce::MidiBuffer midi;
+                while (!stop.stop_requested())
+                {
+                    {
+                        const juce::ScopedLock lock(processor->getCallbackLock());
+                        audio.clear();
+                        processor->processBlock(audio, midi);
+                        ++renderedBlocks;
+                    }
+                    std::this_thread::yield();
+                }
+            });
+            while (renderedBlocks.load() == 0)
+                std::this_thread::yield();
+            for (int recall = 0; recall < 3; ++recall)
+            {
+                // Match the AU wrapper: the host state calls do not take the
+                // processor's callback lock on our behalf.
+                processor->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+                if (renderAndCheck() != referenceScreen)
+                    throw std::runtime_error("Live recall changed the firmware LCD from the serial reference");
+                juce::MemoryBlock saved;
+                processor->getStateInformation(saved);
+                processor->setStateInformation(saved.getData(), static_cast<int>(saved.getSize()));
+                if (renderAndCheck() != referenceScreen)
+                    throw std::runtime_error("Live save/recall changed the firmware LCD");
+            }
+            std::cout << "Live AU preset recall preserved firmware service and the reference LCD\n";
+            return 0;
+        }
         if (argc == 4 && juce::String(argv[1]) == "--check-remembered-firmware")
         {
             auto reopened = std::make_unique<WaveEmulationAudioProcessor>(juce::File(argv[2]));
@@ -83,10 +148,8 @@ int main(int argc, char** argv)
         for (int recall = 0; recall < 8; ++recall)
         {
             juce::MemoryBlock state;
-            {
-                const juce::ScopedLock lock(first->getCallbackLock());
-                first->getStateInformation(state);
-            }
+            first->getStateInformation(state);
+            first->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
             if (state.isEmpty())
                 throw std::runtime_error("Host preset contained no state");
             auto restored = std::make_unique<WaveEmulationAudioProcessor>(preference.getFile());

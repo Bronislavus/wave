@@ -1,5 +1,13 @@
 # Public source release
 
+## Required release approval
+
+Build and test a local candidate first. The project owner must validate the
+candidate in the DAW, including firmware operation after preset save and recall,
+and explicitly approve publication before source changes are pushed or a GitHub
+release is published. Automated tests, signing, notarization, and earlier
+publication requests do not replace approval of the current candidate.
+
 The private development repository contains historical ROM and factory-bank
 blobs. Removing files in a later commit does not remove those historical blobs.
 Do not push this development repository or any of its branches/tags publicly.

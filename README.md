@@ -27,10 +27,14 @@ Older development copies named **Wave Emulation Sample.app** are separate files
 and are not updated by this installer. Versions 0.1.0 and 0.1.1 installed only
 the plugins, so they did not update a standalone app you already had open.
 
-Version 0.1.3 fixes a firmware-emulator concurrency fault that could crash an
-Audio Unit when multiple instances rendered, including during host preset saves.
-It also connects the voice-card workers to the host's macOS audio workgroup
-when one is provided.
+Version 0.1.3 has been withdrawn after a firmware failure during Logic preset
+recall. Version 0.1.4 is a local validation candidate: it synchronizes host preset
+save/restore with the same instance's rendering so firmware reload cannot replace
+shared memory while the emulated CPUs are using it. Publication is pending the
+project owner's DAW validation and explicit approval.
+
+The candidate retains per-thread firmware-emulator state for separate instances
+and connects voice-card workers to the host's macOS audio workgroup when provided.
 
 ### CPU load in Logic Pro
 

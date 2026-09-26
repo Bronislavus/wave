@@ -4511,6 +4511,9 @@ juce::AudioProcessorEditor* WaveEmulationAudioProcessor::createEditor()
 
 void WaveEmulationAudioProcessor::getStateInformation(juce::MemoryBlock& destinationData)
 {
+    // AU hosts may save/restore from a non-render thread without taking this
+    // lock. The firmware, disk and calibration state must remain one snapshot.
+    const juce::ScopedLock callbackLock(getCallbackLock());
     auto state = parameters.copyState();
     state.setProperty("machineStateSchema", machineStateSchemaVersion, nullptr);
     state.setProperty("factoryProgram",
@@ -4667,6 +4670,10 @@ void WaveEmulationAudioProcessor::getStateInformation(juce::MemoryBlock& destina
 
 void WaveEmulationAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
+    // Rebooting the emulated CPUs and replacing shared SRAM must not overlap
+    // this instance's audio callback, even though different instances can run
+    // concurrently. JUCE's AU RestoreState does not acquire this lock for us.
+    const juce::ScopedLock callbackLock(getCallbackLock());
     if (const auto xml = getXmlFromBinary(data, sizeInBytes))
     {
         if (xml->hasTagName(parameters.state.getType()))
