@@ -86,6 +86,7 @@ private:
                                     const juce::String& menuName) override;
     void menuItemSelected(int menuItemId, int topLevelMenuIndex) override;
     void showSystemMenu();
+    void showFirmwareFolderChooser();
     void showDiskImageChooser();
     void showCreateBlankDiskChooser();
     void showCreateDiskFromSetChooser();
@@ -110,6 +111,7 @@ private:
     std::unique_ptr<juce::Drawable> ledOnGreenArtwork;
     std::unique_ptr<juce::Drawable> ledOnRedArtwork;
     std::unique_ptr<juce::Drawable> ledOnYellowArtwork;
+    std::unique_ptr<juce::FileChooser> firmwareFolderChooser;
     std::unique_ptr<juce::FileChooser> diskImageChooser;
     std::unique_ptr<juce::FileChooser> waveSetChooser;
     std::unique_ptr<juce::FileChooser> diskDestinationChooser;

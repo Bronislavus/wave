@@ -37,6 +37,7 @@ constexpr std::array<int, 13> performanceKeys {
 };
 constexpr std::array<int, 7> whiteKeySemitones { 0, 2, 4, 5, 7, 9, 11 };
 constexpr std::array<int, 8> instrumentSwitches { 22, 25, 26, 27, 79, 28, 29, 30 };
+constexpr auto loadFirmwareMenuItem = 0x4707;
 constexpr auto mountDiskMenuItem = 0x4701;
 constexpr auto saveDiskMenuItem = 0x4702;
 constexpr auto ejectDiskMenuItem = 0x4703;
@@ -739,6 +740,8 @@ juce::PopupMenu WaveEmulationAudioProcessorEditor::getMenuForIndex(
     if (topLevelMenuIndex != 0)
         return menu;
 
+    menu.addItem(loadFirmwareMenuItem, "Load System Firmware Folder...");
+    menu.addSeparator();
     const auto mounted = ownerProcessor.hasMountedDiskImage();
     menu.addItem(createBlankDiskMenuItem, "New Blank 720 KB DD Disk Image...");
     menu.addItem(createDiskFromSetMenuItem, "Create Disk Image from Wave Setup...");
@@ -770,6 +773,11 @@ void WaveEmulationAudioProcessorEditor::showSystemMenu()
 
 void WaveEmulationAudioProcessorEditor::menuItemSelected(int menuItemId, int)
 {
+    if (menuItemId == loadFirmwareMenuItem)
+    {
+        showFirmwareFolderChooser();
+        return;
+    }
     if (menuItemId == createBlankDiskMenuItem)
     {
         showCreateBlankDiskChooser();
@@ -805,6 +813,31 @@ void WaveEmulationAudioProcessorEditor::menuItemSelected(int menuItemId, int)
             showDiskError("Could not eject disk image", result);
         menuItemsChanged();
     }
+}
+
+void WaveEmulationAudioProcessorEditor::showFirmwareFolderChooser()
+{
+    firmwareFolderChooser = std::make_unique<juce::FileChooser>(
+        "Select the folder containing w2sys.bin and wdv.sys",
+        juce::File::getSpecialLocation(juce::File::userDocumentsDirectory));
+    firmwareFolderChooser->launchAsync(
+        juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+        [safe = juce::Component::SafePointer(this)](const juce::FileChooser& chooser) {
+            if (safe == nullptr || chooser.getResult() == juce::File{})
+                return;
+            wave::firmware::Bundle candidate;
+            auto report = candidate.load(chooser.getResult());
+            if (report.hasBothImages())
+            {
+                auto& processor = safe->ownerProcessor;
+                const juce::ScopedLock callbackLock(processor.getCallbackLock());
+                report = processor.loadFirmware(chooser.getResult());
+            }
+            juce::AlertWindow::showMessageBoxAsync(
+                report.hasBothImages() ? juce::MessageBoxIconType::InfoIcon
+                                       : juce::MessageBoxIconType::WarningIcon,
+                report.summary, report.detail);
+        });
 }
 
 void WaveEmulationAudioProcessorEditor::showCreateBlankDiskChooser()

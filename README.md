@@ -12,6 +12,37 @@ its [legacy Wave page](https://waldorfmusic.com/legacy-wave/).
 
 The editor embeds `media/WaldorfWaveUI_NOLOGO.svg` as its 2338 x 1042 source artwork. JUCE controls are transparent hit regions aligned to the artwork coordinates, and the live framebuffer is rendered only inside the LCD rectangle at `(939, 237, 448, 70)`. Additional panel switch, rotary, and fader regions are derived at runtime from the circles and rounded rectangles already in that SVG. The eight Performance faders use relative mouse dragging, retain their physical positions across Performance changes, and apply the destination/parameter assignments stored in each native factory Performance record only after a fader is moved. A playable 61-note keyboard spans C2 through C7 in the lower black keyboard bed, with pressed-key feedback and drag glissando.
 
+## Before you start: system and sound floppies
+
+**You must obtain your own Waldorf Wave system floppy files to run the original
+operating system in this emulation.** The installer/DMG does not contain the
+Wave system ROM, voice firmware, factory sound disks, or floppy images. The
+included PPG wavetables are sound data, not the Wave operating system.
+
+1. Find your Wave OS 1.700 system floppy or a copy of its files. You need both
+   `w2sys.bin` and `wdv.sys` together in a folder on your computer. The
+   [Waldorf legacy Wave page](https://waldorfmusic.com/legacy-wave/) is the
+   starting point for the system download; extract its archive before use.
+2. Open the emulation's **System** menu and choose **Load System Firmware
+   Folder...**, then select that folder. The loader checks the system files
+   against the supported firmware. Keep the files in that location so saved
+   sessions can find them again.
+3. To use original sounds and performances, obtain your own Wave sound/setup
+   floppies or disk images. For a physical disk, first make a raw MS-DOS floppy
+   image with suitable disk-imaging hardware/software. In the **System** menu,
+   choose **Mount Disk Image...** and select an `.img`, `.ima`, `.dsk`, or `.st`
+   image. These extensions must contain a supported raw floppy image, not a ZIP.
+   Use the Wave panel's Disk controls to load its contents.
+4. If you have a Wave `.set` file instead, choose **Create Disk Image from Wave
+   Setup...** to create and mount a 720 KB DD image. A new blank disk contains
+   no system firmware or factory sounds.
+
+The app can open without firmware and provide its behavioural synthesis
+fallback, but that does not run the original Wave operating system. Mounting a
+sound disk alone does not supply the system firmware. This implementation does
+not emulate the complete original floppy boot sequence; system firmware is
+loaded separately as described above.
+
 ## Accuracy boundary
 
 This sample is honest about a hard distinction:
