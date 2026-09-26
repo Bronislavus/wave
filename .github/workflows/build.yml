@@ -1,0 +1,15 @@
+name: Public source build
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure without private data or signing
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DWAVE_EMBED_PRIVATE_ASSETS=OFF -DWAVE_SIGN_RELEASE_ARTIFACTS=OFF
+      - name: Build
+        run: cmake --build build --parallel 3
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

@@ -1,0 +1,24 @@
+/build*/
+/Firmware/
+/Sounds/
+/tmp/
+/public-release/
+/wave.set
+/PPG Wave 2.3 version 6.zip
+/Source/Dsp/FactoryUpperWavetables.h
+/media/WaldorfWaveUI.svg
+/Installer/.release-work/
+*.dmg
+*.pkg
+*.rom
+*.img
+*.zip
+*.log
+*.jucer
+.DS_Store
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.key
