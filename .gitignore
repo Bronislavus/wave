@@ -22,3 +22,14 @@
 *.p12
 *.pfx
 *.key
+
+# Signing certificates, Apple API keys, and provisioning material
+*.pem
+*.cer
+*.crt
+*.der
+*.p8
+*.mobileprovision
+*.provisionprofile
+*.keychain
+*.keychain-db
