@@ -12,6 +12,15 @@ its [legacy Wave page](https://waldorfmusic.com/legacy-wave/).
 
 The editor embeds `media/WaldorfWaveUI_NOLOGO.svg` as its 2338 x 1042 source artwork. JUCE controls are transparent hit regions aligned to the artwork coordinates, and the live framebuffer is rendered only inside the LCD rectangle at `(939, 237, 448, 70)`. Additional panel switch, rotary, and fader regions are derived at runtime from the circles and rounded rectangles already in that SVG. The eight Performance faders use relative mouse dragging, retain their physical positions across Performance changes, and apply the destination/parameter assignments stored in each native factory Performance record only after a fader is moved. A playable 61-note keyboard spans C2 through C7 in the lower black keyboard bed, with pressed-key feedback and drag glissando.
 
+## Installing the macOS release
+
+Run the installer inside the release DMG. Starting with version 0.1.2, it installs
+**Wave Emulation.app** in `/Applications` as well as the AU, VST3, and AAX plugins.
+Quit any older standalone instance, then launch `/Applications/Wave Emulation.app`.
+Older development copies named **Wave Emulation Sample.app** are separate files
+and are not updated by this installer. Versions 0.1.0 and 0.1.1 installed only
+the plugins, so they did not update a standalone app you already had open.
+
 ## Before you start: system and sound floppies
 
 **You must obtain your own Waldorf Wave system floppy files to run the original

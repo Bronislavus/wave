@@ -1,13 +1,13 @@
 #!/bin/bash
 # Wave Emulation macOS release builder.
 #
-# Produces a universal AU/VST3/AAX installer and optional DMG. The AAX bundle
+# Produces a universal standalone/AU/VST3/AAX installer and optional DMG. The AAX bundle
 # is PACE-wrapped with the Wave product configuration before it is packaged.
 # Apple credentials are read from the keychain or environment; no passwords
 # are stored in this script.
 #
 # Common overrides:
-#   VERSION=0.1.1
+#   VERSION=0.1.2
 #   BUILD_JOBS=8
 #   SKIP_PLUGIN_BUILD=1
 #   SKIP_WRAP=1
@@ -45,7 +45,7 @@ PACKAGES_DIR="$WORK_DIR/packages"
 RESOURCES_DIR="$WORK_DIR/resources"
 DMG_STAGING_DIR="$WORK_DIR/dmg"
 
-VERSION="${VERSION:-0.1.1}"
+VERSION="${VERSION:-0.1.2}"
 TEAM_ID="${TEAM_ID:-}"
 BUILD_CONFIG="${BUILD_CONFIG:-Release}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-$BUILD_CONFIG}"
@@ -59,6 +59,8 @@ PRODUCT_NAME="Wave Emulation"
 PRODUCT_IDENTIFIER="${PRODUCT_IDENTIFIER:-com.djw.waveemulation}"
 ARTEFACT_DIR="$BUILD_DIR/${TARGET}_artefacts/$BUILD_CONFIG"
 
+APP_NAME="$BUNDLE_NAME.app"
+APP_SOURCE="$ARTEFACT_DIR/Standalone/$APP_NAME"
 AU_NAME="$BUNDLE_NAME.component"
 VST3_NAME="$BUNDLE_NAME.vst3"
 AAX_NAME="$BUNDLE_NAME.aaxplugin"
@@ -121,6 +123,12 @@ validate_bundle() {
     exit 1
   fi
   plutil -lint "$bundle/Contents/Info.plist" >/dev/null
+  local bundle_version
+  bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$bundle/Contents/Info.plist")"
+  if [ "$bundle_version" != "$VERSION" ]; then
+    echo "Error: $bundle has version $bundle_version; expected $VERSION. Rebuild before packaging." >&2
+    exit 1
+  fi
   local executable
   executable="$(bundle_executable "$bundle")"
   local binary="$bundle/Contents/MacOS/$executable"
@@ -206,7 +214,7 @@ build_plugins() {
     -DWAVE_SIGN_RELEASE_ARTIFACTS=OFF \
     -DWAVE_EMBED_PRIVATE_ASSETS=OFF
   cmake --build "$BUILD_DIR" \
-    --target "${TARGET}_AU" "${TARGET}_VST3" "${TARGET}_AAX" \
+    --target "${TARGET}_Standalone" "${TARGET}_AU" "${TARGET}_VST3" "${TARGET}_AAX" \
     --config "$BUILD_CONFIG" -j "$BUILD_JOBS"
 }
 
@@ -246,11 +254,14 @@ wrap_aax() {
 stage_plugins() {
   rm -rf "$WORK_DIR"
   mkdir -p \
+    "$STAGING_DIR/standalone/Applications" \
     "$STAGING_DIR/au/Library/Audio/Plug-Ins/Components" \
     "$STAGING_DIR/vst3/Library/Audio/Plug-Ins/VST3" \
     "$STAGING_DIR/aax/Library/Application Support/Avid/Audio/Plug-Ins" \
     "$PACKAGES_DIR" "$RESOURCES_DIR" "$DMG_STAGING_DIR"
 
+  /usr/bin/ditto --noextattr --norsrc "$APP_SOURCE" \
+    "$STAGING_DIR/standalone/Applications/$APP_NAME"
   /usr/bin/ditto --noextattr --norsrc "$AU_SOURCE" \
     "$STAGING_DIR/au/Library/Audio/Plug-Ins/Components/$AU_NAME"
   /usr/bin/ditto --noextattr --norsrc "$VST3_SOURCE" \
@@ -265,7 +276,8 @@ sign_staged_plugins() {
   fi
   local au="$STAGING_DIR/au/Library/Audio/Plug-Ins/Components/$AU_NAME"
   local vst3="$STAGING_DIR/vst3/Library/Audio/Plug-Ins/VST3/$VST3_NAME"
-  for bundle in "$au" "$vst3"; do
+  local app="$STAGING_DIR/standalone/Applications/$APP_NAME"
+  for bundle in "$app" "$au" "$vst3"; do
     codesign --force --deep --timestamp --options runtime \
       --sign "$CODESIGN_IDENTITY" "$bundle"
     codesign --verify --deep --strict --verbose=2 "$bundle"
@@ -290,14 +302,25 @@ build_component_package() {
   if ! is_truthy "${SKIP_SIGN:-}"; then
     args+=(--sign "$INSTALLER_IDENTITY" --timestamp)
   fi
+  if [ "$identifier" = "$PRODUCT_IDENTIFIER.standalone" ]; then
+    local components="$WORK_DIR/standalone-components.plist"
+    pkgbuild --analyze --root "$root" "$components"
+    # Always install into /Applications, even if an older development copy
+    # with the same bundle identifier exists elsewhere on the machine.
+    /usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$components" 2>/dev/null ||
+      /usr/libexec/PlistBuddy -c "Add :0:BundleIsRelocatable bool false" "$components"
+    args+=(--component-plist "$components")
+  fi
   pkgbuild "${args[@]}" "$output"
 }
 
 build_packages() {
-  for payload in "$STAGING_DIR/au" "$STAGING_DIR/vst3" "$STAGING_DIR/aax"; do
+  for payload in "$STAGING_DIR/standalone" "$STAGING_DIR/au" "$STAGING_DIR/vst3" "$STAGING_DIR/aax"; do
     clean_payload_metadata "$payload"
   done
 
+  build_component_package "$STAGING_DIR/standalone" "$PRODUCT_IDENTIFIER.standalone" \
+    "$PACKAGES_DIR/WaveEmulation_Standalone.pkg"
   build_component_package "$STAGING_DIR/au" "$PRODUCT_IDENTIFIER.au" \
     "$PACKAGES_DIR/WaveEmulation_AU.pkg"
   build_component_package "$STAGING_DIR/vst3" "$PRODUCT_IDENTIFIER.vst3" \
@@ -309,7 +332,7 @@ build_packages() {
 <!doctype html><html><head><meta charset="utf-8"></head>
 <body style="font-family:-apple-system,Helvetica Neue,sans-serif;padding:20px">
 <h1>DJW $PRODUCT_NAME</h1>
-<p>This installer provides the AU, VST3 and AAX instrument formats.</p>
+<p>This installer provides the Wave Emulation standalone app in /Applications, plus AU, VST3 and AAX instrument formats.</p>
 <p style="color:#666;font-size:12px">Version $VERSION</p>
 </body></html>
 WELCOME
@@ -322,11 +345,13 @@ WELCOME
   <welcome file="welcome.html"/>
   <options customize="allow" require-scripts="false" hostArchitectures="arm64,x86_64"/>
   <choices-outline>
-    <line choice="au"/><line choice="vst3"/><line choice="aax"/>
+    <line choice="standalone"/><line choice="au"/><line choice="vst3"/><line choice="aax"/>
   </choices-outline>
+  <choice id="standalone" title="Standalone Application"><pkg-ref id="$PRODUCT_IDENTIFIER.standalone"/></choice>
   <choice id="au" title="Audio Unit"><pkg-ref id="$PRODUCT_IDENTIFIER.au"/></choice>
   <choice id="vst3" title="VST3"><pkg-ref id="$PRODUCT_IDENTIFIER.vst3"/></choice>
   <choice id="aax" title="AAX"><pkg-ref id="$PRODUCT_IDENTIFIER.aax"/></choice>
+  <pkg-ref id="$PRODUCT_IDENTIFIER.standalone" version="$VERSION">WaveEmulation_Standalone.pkg</pkg-ref>
   <pkg-ref id="$PRODUCT_IDENTIFIER.au" version="$VERSION">WaveEmulation_AU.pkg</pkg-ref>
   <pkg-ref id="$PRODUCT_IDENTIFIER.vst3" version="$VERSION">WaveEmulation_VST3.pkg</pkg-ref>
   <pkg-ref id="$PRODUCT_IDENTIFIER.aax" version="$VERSION">WaveEmulation_AAX.pkg</pkg-ref>
@@ -441,6 +466,7 @@ find_signing_identities
 validate_pace_wrap_config
 rm -f "$FINAL_PKG" "$FINAL_DMG"
 build_plugins
+validate_bundle "$APP_SOURCE"
 validate_bundle "$AU_SOURCE"
 validate_bundle "$VST3_SOURCE"
 validate_bundle "$AAX_SOURCE"
