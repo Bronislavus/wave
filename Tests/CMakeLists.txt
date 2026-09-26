@@ -8,6 +8,19 @@ target_link_libraries(WaveCoreTests
 
 add_test(NAME WaveCoreTests COMMAND WaveCoreTests)
 
+find_package(Threads REQUIRED)
+add_executable(M68000ThreadTests M68000ThreadTests.cpp ../Source/Firmware/M68000.cpp)
+target_include_directories(M68000ThreadTests PRIVATE ../Source)
+target_link_libraries(M68000ThreadTests PRIVATE WaveM68k Threads::Threads)
+add_test(NAME M68000ThreadTests COMMAND M68000ThreadTests)
+set_tests_properties(M68000ThreadTests PROPERTIES TIMEOUT 60)
+
+add_executable(WaveHostStateTests WaveHostStateTests.cpp)
+target_include_directories(WaveHostStateTests PRIVATE ../Source)
+target_link_libraries(WaveHostStateTests PRIVATE WaveEmulation juce::juce_audio_utils Threads::Threads)
+add_test(NAME WaveHostStateTests COMMAND WaveHostStateTests)
+set_tests_properties(WaveHostStateTests PROPERTIES TIMEOUT 120)
+
 if(WAVE_HAS_PRIVATE_ROMS)
     add_executable(WaveIntegrationTests WaveIntegrationTests.cpp)
     target_include_directories(WaveIntegrationTests PRIVATE ${CMAKE_SOURCE_DIR}/Source)

@@ -27,6 +27,23 @@ Older development copies named **Wave Emulation Sample.app** are separate files
 and are not updated by this installer. Versions 0.1.0 and 0.1.1 installed only
 the plugins, so they did not update a standalone app you already had open.
 
+Version 0.1.3 fixes a firmware-emulator concurrency fault that could crash an
+Audio Unit when multiple instances rendered, including during host preset saves.
+It also connects the voice-card workers to the host's macOS audio workgroup
+when one is provided.
+
+### CPU load in Logic Pro
+
+Wave can split voice processing across three threads at higher polyphony.
+Light loads and very short audio segments run serially to avoid worker overhead;
+the firmware timeline also remains sequential. A single busy bar in Logic's
+meter therefore does not imply that all work can be evenly spread across cores.
+
+For multiple live instrument channel strips, try **Settings > Audio > Devices >
+Multithreading > Playback & Live Tracks**. This lets Logic distribute eligible
+live tracks across processing threads; it does not automatically divide one
+plugin's processing. See [Apple's multithreading guide](https://support.apple.com/en-ae/101975).
+
 ## Before you start: system and sound floppies
 
 **You must obtain your own Waldorf Wave system floppy files to run the original
@@ -40,8 +57,11 @@ included PPG wavetables are sound data, not the Wave operating system.
    starting point for the system download; extract its archive before use.
 2. Open the emulation's **System** menu and choose **Load System Firmware
    Folder...**, then select that folder. The loader checks the system files
-   against the supported firmware. Keep the files in that location so saved
-   sessions can find them again.
+   against the supported firmware. From version 0.1.3, a successful selection is
+   remembered for new plugin and standalone instances, including after restarting
+   your DAW. Saved projects retain their own folder reference, with the remembered
+   folder as a fallback. Keep the files in place; if you move them, select their
+   new folder once. Only the location is remembered, not a copy of the firmware.
 3. To use original sounds and performances, obtain your own Wave sound/setup
    floppies or disk images. For a physical disk, first make a raw MS-DOS floppy
    image with suitable disk-imaging hardware/software. In the **System** menu,

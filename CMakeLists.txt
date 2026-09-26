@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(WaveEmulationSample VERSION 0.1.2 LANGUAGES C CXX)
+project(WaveEmulationSample VERSION 0.1.3 LANGUAGES C CXX)
 
 include(FetchContent)
 
@@ -35,6 +35,10 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(Musashi)
 
+include(cmake/PrepareMusashi.cmake)
+set(WAVE_MUSASHI_DIR "${CMAKE_CURRENT_BINARY_DIR}/wave-musashi")
+wave_prepare_musashi("${musashi_SOURCE_DIR}" "${WAVE_MUSASHI_DIR}")
+
 add_executable(WaveM68kGenerator EXCLUDE_FROM_ALL
     ${musashi_SOURCE_DIR}/m68kmake.c)
 
@@ -51,12 +55,18 @@ add_custom_command(
     VERBATIM)
 
 add_library(WaveM68k STATIC
-    ${musashi_SOURCE_DIR}/m68kcpu.c
-    ${musashi_SOURCE_DIR}/softfloat/softfloat.c
+    ${WAVE_MUSASHI_DIR}/m68kcpu.c
+    ${WAVE_MUSASHI_DIR}/softfloat/softfloat.c
     ${MUSASHI_GENERATED_DIR}/m68kops.c)
 target_include_directories(WaveM68k PUBLIC
-    ${musashi_SOURCE_DIR}
+    ${WAVE_MUSASHI_DIR}
     ${MUSASHI_GENERATED_DIR})
+target_compile_features(WaveM68k PRIVATE c_std_11)
+if(MSVC)
+    target_compile_definitions(WaveM68k PRIVATE "WAVE_M68K_THREAD_LOCAL=__declspec(thread)")
+else()
+    target_compile_definitions(WaveM68k PRIVATE WAVE_M68K_THREAD_LOCAL=_Thread_local)
+endif()
 target_compile_definitions(WaveM68k PRIVATE
     M68K_EMULATE_010=0
     M68K_EMULATE_EC020=0

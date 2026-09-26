@@ -149,6 +149,7 @@ public:
 
     void run() override
     {
+        juce::WorkgroupToken workgroupToken;
         uint32_t handledGeneration = 0;
         for (;;)
         {
@@ -161,6 +162,9 @@ public:
             if (threadShouldExit())
                 return;
 
+            // The dispatch/completion barriers also protect the host workgroup.
+            // Join and leave on this worker; rejoining the same group is a no-op.
+            engine.audioWorkgroup.join(workgroupToken);
             engine.renderVoiceCard(board, jobSamples);
             handledGeneration = requested;
             completedGeneration.store(handledGeneration, std::memory_order_release);

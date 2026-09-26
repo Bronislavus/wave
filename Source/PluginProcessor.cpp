@@ -19,6 +19,16 @@ constexpr int machineStateSchemaVersion = 2;
 constexpr int machineEditBufferMagic = 0x57415645; // "WAVE"
 constexpr uint32_t firmwareEditPerformanceOffset = 0x5400u;
 constexpr auto hostStateDirectoryName = "Waldorf Wave Host State";
+
+juce::File defaultFirmwarePreferenceFile()
+{
+    auto directory = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory);
+   #if JUCE_MAC
+    directory = directory.getChildFile("Application Support");
+   #endif
+    return directory.getChildFile("DJW/Wave Emulation/firmware-folder.txt");
+}
+
 constexpr std::array panelOperatingPageButtonCodes {
     38, 33, 35, 34, 32, 37, 36, 39
 };
@@ -582,9 +592,11 @@ bool applyFirmwareModifierRouting(
 }
 } // namespace
 
-WaveEmulationAudioProcessor::WaveEmulationAudioProcessor()
+WaveEmulationAudioProcessor::WaveEmulationAudioProcessor(const juce::File& preferenceFile)
     : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
-      parameters(*this, nullptr, "WaveState", wave::parameters::createLayout())
+      parameters(*this, nullptr, "WaveState", wave::parameters::createLayout()),
+      firmwarePreferenceFile(preferenceFile == juce::File{}
+                                 ? defaultFirmwarePreferenceFile() : preferenceFile)
 {
     for (auto& value : pendingFirmwareFaderValues)
         value.store(-1, std::memory_order_relaxed);
@@ -635,6 +647,7 @@ WaveEmulationAudioProcessor::WaveEmulationAudioProcessor()
     loadEmbeddedFactorySet();
     loadEmbeddedPrivateRoms();
     applyFactoryProgram(0, false);
+    loadRememberedFirmware();
 }
 
 WaveEmulationAudioProcessor::~WaveEmulationAudioProcessor()
@@ -1219,6 +1232,11 @@ void WaveEmulationAudioProcessor::prepareToPlay(double sampleRate, int samplesPe
     seedFilterCalibrationTable();
     outputPeak.store(0.0f);
     localKeyboardTransposedNotes.fill(-1);
+}
+
+void WaveEmulationAudioProcessor::audioWorkgroupContextChanged(const juce::AudioWorkgroup& workgroup)
+{
+    engine.setAudioWorkgroup(workgroup);
 }
 
 void WaveEmulationAudioProcessor::releaseResources()
@@ -4695,8 +4713,8 @@ void WaveEmulationAudioProcessor::setStateInformation(const void* data, int size
             const auto savedDirectory = parameters.state.getProperty("firmwareDirectory").toString();
             if (savedDirectory.isNotEmpty())
             {
-                const auto report = loadFirmware(juce::File(savedDirectory));
-                if (!report.hasBothImages())
+                const auto report = loadFirmware(juce::File(savedDirectory), false);
+                if (!report.hasBothImages() && !loadRememberedFirmware())
                     loadEmbeddedPrivateRoms();
             }
             removeRestoredHostStateDisk();
@@ -4947,11 +4965,32 @@ void WaveEmulationAudioProcessor::setStateInformation(const void* data, int size
     }
 }
 
-wave::firmware::Bundle::Report WaveEmulationAudioProcessor::loadFirmware(
-    const juce::File& directoryOrImage)
+bool WaveEmulationAudioProcessor::loadRememberedFirmware()
 {
-    const auto report = firmware.load(directoryOrImage);
-    return startLoadedFirmware(report, true);
+    const auto path = firmwarePreferenceFile.loadFileAsString().trim();
+    if (!juce::File::isAbsolutePath(path) || !juce::File(path).isDirectory())
+        return false;
+    return loadFirmware(juce::File(path), false).hasBothImages();
+}
+
+wave::firmware::Bundle::Report WaveEmulationAudioProcessor::loadFirmware(
+    const juce::File& directoryOrImage, bool rememberForNewInstances)
+{
+    // Validate before replacing a working pair, including on stale session paths.
+    wave::firmware::Bundle candidate;
+    auto report = candidate.load(directoryOrImage);
+    if (!report.hasBothImages())
+        return report;
+    firmware = std::move(candidate);
+    report = startLoadedFirmware(report, true);
+    if (rememberForNewInstances)
+    {
+        const auto created = firmwarePreferenceFile.getParentDirectory().createDirectory();
+        if (created.failed() || !firmwarePreferenceFile.replaceWithText(
+                                   firmware.getDirectory().getFullPathName()))
+            report.detail += " The firmware loaded, but its folder could not be remembered for new instances.";
+    }
+    return report;
 }
 
 wave::firmware::Bundle::Report WaveEmulationAudioProcessor::startLoadedFirmware(

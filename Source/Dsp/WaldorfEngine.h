@@ -106,6 +106,8 @@ public:
     ~WaldorfEngine();
 
     void prepare(double sampleRate, int maximumBlockSize);
+    // Called by the host between render callbacks, while all card jobs are idle.
+    void setAudioWorkgroup(const juce::AudioWorkgroup& workgroup) { audioWorkgroup = workgroup; }
     void reset();
     void render(juce::AudioBuffer<float>& output, const juce::MidiBuffer& midi,
                 const parameters::Snapshot& parameters);
@@ -340,6 +342,7 @@ private:
     std::vector<float> voiceLeftScratch;
     std::vector<float> voiceRightScratch;
     std::array<std::unique_ptr<VoiceCardWorker>, voiceBoardCount - 1> cardWorkers;
+    juce::AudioWorkgroup audioWorkgroup;
     std::atomic<bool> voiceCardThreadingEnabled { true };
     uint64_t parallelCardRenders = 0;
     WaveOutputStage outputStage;

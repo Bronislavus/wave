@@ -29,11 +29,12 @@ public:
         solo
     };
 
-    WaveEmulationAudioProcessor();
+    explicit WaveEmulationAudioProcessor(const juce::File& firmwarePreferenceFile = {});
     ~WaveEmulationAudioProcessor() override;
 
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
+    void audioWorkgroupContextChanged(const juce::AudioWorkgroup& workgroup) override;
     bool isBusesLayoutSupported(const BusesLayout& layouts) const override;
     void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
@@ -83,7 +84,8 @@ public:
     void getStateInformation(juce::MemoryBlock& destinationData) override;
     void setStateInformation(const void* data, int sizeInBytes) override;
 
-    wave::firmware::Bundle::Report loadFirmware(const juce::File& directoryOrImage);
+    wave::firmware::Bundle::Report loadFirmware(const juce::File& directoryOrImage,
+                                               bool rememberForNewInstances = true);
     bool loadWavetableRom(const juce::File& image);
     juce::Result mountDiskImage(const juce::File& image);
     juce::Result createBlankDiskImage(const juce::File& destination);
@@ -273,6 +275,8 @@ private:
         std::array<bool, 8> soundRecordValid {};
     };
 
+    const juce::File firmwarePreferenceFile;
+    bool loadRememberedFirmware();
     wave::dsp::WaldorfEngine engine;
     wave::firmware::Bundle firmware;
     wave::firmware::SharedFirmwareMemory sharedFirmwareMemory;

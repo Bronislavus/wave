@@ -14,6 +14,17 @@ thread_local wave::firmware::M68000Bus* activeBus = nullptr;
 thread_local wave::firmware::M68000* activeCpu = nullptr;
 std::once_flag initialiseCore;
 
+// Only callbacks during a core operation may read live registers. A host can
+// move a processor to another thread between render calls.
+struct ActiveCoreScope
+{
+    ~ActiveCoreScope()
+    {
+        activeCpu = nullptr;
+        activeBus = nullptr;
+    }
+};
+
 [[nodiscard]] uint32_t masked(uint32_t address) noexcept
 {
     return address & 0x00ffffffu;
@@ -76,7 +87,12 @@ namespace wave::firmware
 void M68000::reset(M68000Bus& bus)
 {
     std::call_once(initialiseCore, [] { m68k_init(); });
+    // The opcode tables are shared and initialized once. Default callbacks
+    // belong to each thread's core and must also be initialized on that thread.
+    m68k_init();
+    const ActiveCoreScope scope;
     activeBus = &bus;
+    activeCpu = this;
     m68k_set_cpu_type(M68K_CPU_TYPE_68000);
     m68k_pulse_reset();
     context.resize(m68k_context_size());
@@ -87,6 +103,7 @@ void M68000::reset(M68000Bus& bus)
 void M68000::start(M68000Bus& bus, uint32_t stackPointerValue, uint32_t programCounterValue)
 {
     reset(bus);
+    const ActiveCoreScope scope;
     activate(bus);
     m68k_set_reg(M68K_REG_SP, stackPointerValue);
     m68k_set_reg(M68K_REG_PC, programCounterValue);
@@ -98,6 +115,7 @@ int M68000::execute(M68000Bus& bus, int cycles)
     if (!initialised || cycles <= 0)
         return 0;
 
+    const ActiveCoreScope scope;
     activate(bus);
     const auto executed = m68k_execute(cycles);
     save();
@@ -114,6 +132,7 @@ void M68000::setInterruptLevel(M68000Bus& bus, int level)
 {
     if (!initialised)
         return;
+    const ActiveCoreScope scope;
     activate(bus);
     m68k_set_irq(static_cast<unsigned int>(std::clamp(level, 0, 7)));
     save();
@@ -123,6 +142,7 @@ void M68000::setDataRegister(M68000Bus& bus, int index, uint32_t value)
 {
     if (!initialised || index < 0 || index >= 8)
         return;
+    const ActiveCoreScope scope;
     activate(bus);
     m68k_set_reg(static_cast<m68k_register_t>(M68K_REG_D0 + index), value);
     save();
@@ -171,7 +191,7 @@ bool M68000::returnFromSubroutine(uint32_t dataRegister0) noexcept
 
 int M68000::currentExecutionCycleOffset() const noexcept
 {
-    return initialised ? m68k_cycles_run() : 0;
+    return activeCpu == this ? m68k_cycles_run() : 0;
 }
 
 uint32_t M68000::fastForwardDbraLoop(M68000Bus& bus, int dataRegister,
@@ -180,6 +200,7 @@ uint32_t M68000::fastForwardDbraLoop(M68000Bus& bus, int dataRegister,
     if (!initialised || dataRegister < 0 || dataRegister >= 8)
         return 0;
 
+    const ActiveCoreScope scope;
     activate(bus);
     const auto reg = static_cast<m68k_register_t>(M68K_REG_D0 + dataRegister);
     const auto value = m68k_get_reg(nullptr, reg);

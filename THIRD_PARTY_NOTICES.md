@@ -6,6 +6,10 @@ This project fetches and links the Musashi Motorola 680x0 emulation engine from
 https://github.com/kstenerud/Musashi at commit
 `313ebf1bd9f4d0d93341eb5ce21fd8a119e9dbdd`.
 
+The build applies `cmake/PrepareMusashi.cmake` to a private build copy to make
+MC68000 execution registers, cycle counters, callbacks, and exception jump
+buffers thread-local. The upstream checkout is not modified.
+
 Copyright (c) 1998-2001 Karl Stenerud
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
