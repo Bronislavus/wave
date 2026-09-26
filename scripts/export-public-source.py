@@ -11,7 +11,8 @@ ALLOWED_ROOTS = {"Source", "Tests", "Tools", "cmake", "media", "scripts",
 ALLOWED_FILES = {".gitignore", "CMakeLists.txt", "README.md", "LICENSE",
                  "THIRD_PARTY_NOTICES.md", "CONTRIBUTING.md", "PUBLIC_RELEASE.md",
                  "waldorf-wave-firmware-reverse-engineering.md",
-                 "data/ppg-v6-wavetables.bin", "data/README.md"}
+                 "data/ppg-v6-wavetables.bin", "data/README.md",
+                 "media/wave-emulation-screenshot.png"}
 EXCLUDED = {"Source/Dsp/FactoryUpperWavetables.h", "media/WaldorfWaveUI.svg"}
 SOURCE_SUFFIXES = {".cpp", ".h", ".cmake", ".svg", ".sh", ".py", ".md", ".txt", ".yml"}
 

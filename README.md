@@ -1,5 +1,7 @@
 # Wave Emulation
 
+![Wave Emulation standalone interface](media/wave-emulation-screenshot.png)
+
 A JUCE C++ research instrument that recreates the documented Waldorf Wave signal path: 250 kHz 8-bit/time-multiplexed wavetable voices, the ES2 ASIC's signed mixer overflow, the ASIC's 12 dB digital high-pass, CEM3387 three-pole reconstruction and separately saturating nonlinear resonant four-pole low-pass sections, 12-bit control-voltage stepping, VCA/panning, and the 480 x 64 monochrome graphic LCD.
 
 The public build includes the decoded PPG V6 wavetable sample bank, with
