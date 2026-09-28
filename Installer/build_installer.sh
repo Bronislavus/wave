@@ -7,7 +7,8 @@
 # are stored in this script.
 #
 # Common overrides:
-#   VERSION=0.1.6
+#   VERSION=0.1.6            (must match the built bundles)
+#   RELEASE_LABEL=0.1.6-resizable  (shown in file names and the installer)
 #   BUILD_JOBS=8
 #   SKIP_PLUGIN_BUILD=1
 #   SKIP_WRAP=1
@@ -46,6 +47,8 @@ RESOURCES_DIR="$WORK_DIR/resources"
 DMG_STAGING_DIR="$WORK_DIR/dmg"
 
 VERSION="${VERSION:-0.1.6}"
+# Label for a derived release; the bundle version itself stays numeric.
+RELEASE_LABEL="${RELEASE_LABEL:-$VERSION}"
 TEAM_ID="${TEAM_ID:-}"
 BUILD_CONFIG="${BUILD_CONFIG:-Release}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-$BUILD_CONFIG}"
@@ -83,8 +86,8 @@ NOTARIZE_PASSWORD="${NOTARIZE_PASSWORD:-${APP_SPECIFIC_PASSWORD:-}}"
 NOTARIZE_TEAM_ID="${NOTARIZE_TEAM_ID:-$TEAM_ID}"
 NOTARIZE_DMG="${NOTARIZE_DMG:-1}"
 
-FINAL_PKG_NAME="${FINAL_PKG_NAME:-DJW $PRODUCT_NAME Installer $VERSION.pkg}"
-FINAL_DMG_NAME="${FINAL_DMG_NAME:-DJW $PRODUCT_NAME $VERSION.dmg}"
+FINAL_PKG_NAME="${FINAL_PKG_NAME:-DJW $PRODUCT_NAME Installer $RELEASE_LABEL.pkg}"
+FINAL_DMG_NAME="${FINAL_DMG_NAME:-DJW $PRODUCT_NAME $RELEASE_LABEL.dmg}"
 FINAL_PKG="$INSTALLER_DIR/$FINAL_PKG_NAME"
 FINAL_DMG="$PROJECT_ROOT/$FINAL_DMG_NAME"
 
@@ -342,7 +345,7 @@ build_packages() {
   cat >"$RESOURCES_DIR/welcome.html" <<WELCOME
 <!doctype html><html><head><meta charset="utf-8"></head>
 <body style="font-family:-apple-system,Helvetica Neue,sans-serif;padding:20px;font-size:13px">
-<h1 style="font-size:20px">$PRODUCT_NAME <span style="font-weight:normal;color:#666">$VERSION</span></h1>
+<h1 style="font-size:20px">$PRODUCT_NAME <span style="font-weight:normal;color:#666">$RELEASE_LABEL</span></h1>
 <p>This installer provides the Wave Emulation standalone app in /Applications, plus AU, VST3 and AAX instrument formats.</p>
 <h2 style="font-size:14px">Authors</h2>
 <p>Original software: <b>Wave Emulation</b> &copy; 2026 Dave Whiting
@@ -355,7 +358,7 @@ The sound engine is unchanged.</p>
 <h2 style="font-size:14px">License</h2>
 <p>Free software under the GNU General Public License, version 3 or later, with no warranty.
 The complete source code of this version is included on this disk image
-(<i>Wave Emulation $VERSION Source.zip</i>). JUCE is used under the AGPLv3; see the
+(<i>Wave Emulation $RELEASE_LABEL Source.zip</i>). JUCE is used under the AGPLv3; see the
 third-party notices on the disk image.</p>
 <p style="color:#666;font-size:11px">No Waldorf system firmware, sound sets or floppy images are included &ndash;
 supply your own Wave OS 1.700 files. Waldorf and Wave are trademarks of their respective owner;
@@ -466,7 +469,7 @@ build_dmg() {
   # Build folders, release work files and any private firmware/sound data are
   # excluded - they are not part of the source and must not be redistributed.
   (cd "$PROJECT_ROOT/.." && /usr/bin/zip -qr -X \
-    "$DMG_STAGING_DIR/Wave Emulation $VERSION Source.zip" \
+    "$DMG_STAGING_DIR/Wave Emulation $RELEASE_LABEL Source.zip" \
     "$(basename "$PROJECT_ROOT")" \
     -x "*/build/*" "*/build-*/*" "*/.release-work/*" "*/Firmware/*" \
        "*.dmg" "*.pkg" "*.set" "*/.env.local" "*/.git/*" "*.DS_Store")
@@ -490,7 +493,7 @@ build_dmg() {
 }
 
 echo "=== DJW $PRODUCT_NAME Release Builder ==="
-echo "Version:        $VERSION"
+echo "Version:        $VERSION ($RELEASE_LABEL)"
 echo "Architectures:  $CMAKE_OSX_ARCHITECTURES"
 echo "PACE account:   $PACE_ACCOUNT"
 echo "PACE WCGUID:    $PACE_WCGUID"
