@@ -26,6 +26,13 @@ public:
     bool keyStateChanged(bool isKeyDown) override;
     void focusLost(FocusChangeType) override;
 
+    enum class PanelLayout
+    {
+        full = 0,
+        noKeyboard = 1,
+        panelOnly = 2
+    };
+
 private:
     class WaveLookAndFeel;
     class ParameterKnob;
@@ -81,6 +88,12 @@ private:
     void releaseComputerKeyboardNotes();
     void releaseComputerKeyboardShift();
     void timerCallback() override;
+    [[nodiscard]] float visibleDesignHeight() const noexcept;
+    [[nodiscard]] float currentScale() const noexcept;
+    [[nodiscard]] float fitToScreenScale() const;
+    [[nodiscard]] juce::Rectangle<float> fullArtworkBounds(float pixelScale) const noexcept;
+    void applyLayout(PanelLayout layout, float scale);
+    void stepZoom(int direction);
     juce::StringArray getMenuBarNames() override;
     juce::PopupMenu getMenuForIndex(int topLevelMenuIndex,
                                     const juce::String& menuName) override;
@@ -95,6 +108,10 @@ private:
     void showDiskError(const juce::String& title, const juce::Result& result);
 
     WaveEmulationAudioProcessor& ownerProcessor;
+    std::unique_ptr<juce::PropertiesFile> uiSettings;
+    PanelLayout panelLayout = PanelLayout::full;
+    bool layoutInitialised = false;
+    juce::Colour keybedCoverColour { 0xff2b2b3f };
     std::unique_ptr<WaveLookAndFeel> lookAndFeel;
     std::vector<std::unique_ptr<ParameterKnob>> knobs;
     std::unique_ptr<wave::ui::WaveLcdComponent> lcd;

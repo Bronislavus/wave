@@ -64,6 +64,31 @@ Multithreading > Playback & Live Tracks**. This lets Logic distribute eligible
 live tracks across processing threads; it does not automatically divide one
 plugin's processing. See [Apple's multithreading guide](https://support.apple.com/en-ae/101975).
 
+## Modified version
+
+This is a modified version of Wave Emulation 0.1.6 by Dave Whiting, changed by
+Bronisław Hońca ([bronislawhonca.pl](https://bronislawhonca.pl)) on 2026-09-27. Changes: resizable, screen-fitting editor
+window with zoom steps and shortcuts, compact layouts without the on-screen
+keyboard, remembered window size and layout, a local macOS build script
+(`build-mac.sh`), and an installer/DMG that includes this source code, the
+license and author information. The sound engine and firmware handling are
+unchanged. Distributed under the same GPL-3.0-or-later license.
+
+## Window size and compact layouts
+
+The editor opens at a size that fits the current screen and remembers the last
+zoom and layout (stored in `~/Library/Application Support/Wave Emulation/`).
+Open the floppy-icon **System** menu at the top left and choose **View**:
+
+- **Full Panel with Keyboard** – the original layout.
+- **Hide On-Screen Keyboard** – keeps the transport, Shift and Glide controls but
+  removes the keybed, wheels, octave buttons and System Volume.
+- **Upper Panel Only** – just the synthesis panel and display.
+- **Fit to Screen**, **Zoom In/Out** and fixed zoom steps from 35 % to 100 %.
+
+Shortcuts while the editor has focus: Cmd + / Cmd − to zoom, Cmd 0 to fit the
+screen. The window can also be resized by dragging its lower-right corner.
+
 ## Before you start: system and sound floppies
 
 **You must obtain your own Waldorf Wave system floppy files to run the original
