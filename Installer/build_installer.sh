@@ -336,21 +336,43 @@ build_packages() {
   build_component_package "$STAGING_DIR/aax" "$PRODUCT_IDENTIFIER.aax" \
     "$PACKAGES_DIR/WaveEmulation_AAX.pkg"
 
+  MODIFIED_BY="${MODIFIED_BY:-Bronisław Hońca}"
+  MODIFIED_DATE="${MODIFIED_DATE:-2026-09-27}"
+  MODIFIED_URL="${MODIFIED_URL:-https://bronislawhonca.pl}"
   cat >"$RESOURCES_DIR/welcome.html" <<WELCOME
 <!doctype html><html><head><meta charset="utf-8"></head>
-<body style="font-family:-apple-system,Helvetica Neue,sans-serif;padding:20px">
-<h1>DJW $PRODUCT_NAME</h1>
+<body style="font-family:-apple-system,Helvetica Neue,sans-serif;padding:20px;font-size:13px">
+<h1 style="font-size:20px">$PRODUCT_NAME <span style="font-weight:normal;color:#666">$VERSION</span></h1>
 <p>This installer provides the Wave Emulation standalone app in /Applications, plus AU, VST3 and AAX instrument formats.</p>
-<p style="color:#666;font-size:12px">Version $VERSION</p>
+<h2 style="font-size:14px">Authors</h2>
+<p>Original software: <b>Wave Emulation</b> &copy; 2026 Dave Whiting
+(<a href="https://github.com/mo0kid/wave">github.com/mo0kid/wave</a>).</p>
+<p>This is a <b>modified version</b>, changed by $MODIFIED_BY
+(<a href="$MODIFIED_URL">${MODIFIED_URL#https://}</a>) on $MODIFIED_DATE:
+resizable editor window that fits the screen, zoom steps and shortcuts (Cmd +, Cmd &minus;, Cmd 0),
+compact layouts without the on-screen keyboard, remembered window size and layout.
+The sound engine is unchanged.</p>
+<h2 style="font-size:14px">License</h2>
+<p>Free software under the GNU General Public License, version 3 or later, with no warranty.
+The complete source code of this version is included on this disk image
+(<i>Wave Emulation $VERSION Source.zip</i>). JUCE is used under the AGPLv3; see the
+third-party notices on the disk image.</p>
+<p style="color:#666;font-size:11px">No Waldorf system firmware, sound sets or floppy images are included &ndash;
+supply your own Wave OS 1.700 files. Waldorf and Wave are trademarks of their respective owner;
+this project is not affiliated with or endorsed by Waldorf Music.</p>
 </body></html>
 WELCOME
+  # The GPL text is shown as a Read Me page: the GPL does not require the
+  # recipient to accept it, so it is deliberately not a click-to-agree license.
+  /usr/bin/ditto --noextattr --norsrc "$PROJECT_ROOT/LICENSE" "$RESOURCES_DIR/License.txt"
 
   cat >"$WORK_DIR/distribution.xml" <<DISTRIBUTION
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
   <title>DJW $PRODUCT_NAME</title>
   <organization>com.djw</organization>
-  <welcome file="welcome.html"/>
+  <welcome file="welcome.html" mime-type="text/html"/>
+  <readme file="License.txt" mime-type="text/plain"/>
   <options customize="allow" require-scripts="false" hostArchitectures="arm64,x86_64"/>
   <volume-check><allowed-os-versions><os-version min="$CMAKE_OSX_DEPLOYMENT_TARGET"/></allowed-os-versions></volume-check>
   <choices-outline>
@@ -440,6 +462,17 @@ build_dmg() {
     /usr/bin/ditto --noextattr --norsrc "$MANUAL_PDF" \
       "$DMG_STAGING_DIR/$(basename "$MANUAL_PDF")"
   fi
+  # GPL: ship the complete corresponding source next to the binaries.
+  # Build folders, release work files and any private firmware/sound data are
+  # excluded - they are not part of the source and must not be redistributed.
+  (cd "$PROJECT_ROOT/.." && /usr/bin/zip -qr -X \
+    "$DMG_STAGING_DIR/Wave Emulation $VERSION Source.zip" \
+    "$(basename "$PROJECT_ROOT")" \
+    -x "*/build/*" "*/build-*/*" "*/.release-work/*" "*/Firmware/*" \
+       "*.dmg" "*.pkg" "*.set" "*/.env.local" "*/.git/*" "*.DS_Store")
+  for doc in LICENSE THIRD_PARTY_NOTICES.md; do
+    /usr/bin/ditto --noextattr --norsrc "$PROJECT_ROOT/$doc" "$DMG_STAGING_DIR/$doc"
+  done
   rm -f "$FINAL_DMG"
   hdiutil create -volname "DJW $PRODUCT_NAME" -srcfolder "$DMG_STAGING_DIR" \
     -ov -format UDZO "$FINAL_DMG"
