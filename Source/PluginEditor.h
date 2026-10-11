@@ -110,6 +110,10 @@ private:
     void showDiskError(const juce::String& title, const juce::Result& result);
     void setWindowScale(float scale);
     void setKeyboardVisible(bool visible);
+    [[nodiscard]] float activeDesignHeight() const noexcept;
+    [[nodiscard]] float fitToScreenScale() const;
+    void restoreWindowPreferences();
+    void saveWindowPreferences();
 
     WaveEmulationAudioProcessor& ownerProcessor;
     std::unique_ptr<WaveLookAndFeel> lookAndFeel;
@@ -164,6 +168,8 @@ private:
     std::array<bool, 13> keyboardNotes{};
     bool computerShiftDown = false;
     bool keyboardVisible = true;
+    std::unique_ptr<juce::PropertiesFile> windowSettings;
+    bool windowPreferencesRestored = false;
     bool compactSkin = false;
     bool performanceMode = true;
     int selectedLfo = 0;

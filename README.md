@@ -4,6 +4,24 @@
 
 A JUCE C++ research instrument that recreates the documented Waldorf Wave signal path: 250 kHz 8-bit/time-multiplexed wavetable voices, the ES2 ASIC's signed mixer overflow, the ASIC's 12 dB digital high-pass, CEM3387 three-pole reconstruction and separately saturating nonlinear resonant four-pole low-pass sections, 12-bit control-voltage stepping, VCA/panning, and the 480 x 64 monochrome graphic LCD.
 
+## This modified version (0.1.13-resizable)
+
+This fork of Wave Emulation 0.1.13 by Dave Whiting was modified by
+Bronisław Hońca ([bronislawhonca.pl](https://bronislawhonca.pl)) on 2026-10-11.
+On top of the original zoom and compact-skin features, the editor now opens at
+a size that fits the screen instead of the full 2338-pixel panel, remembers its
+zoom and keyboard visibility between sessions, and offers **System → Fit to
+Screen** (Cmd/Ctrl + Shift + 0). `build-mac.sh` makes a quick local build, and
+the installer adds an author and modification notice, shows the GPL and puts
+the complete source code on the DMG. The sound engine is unchanged. Distributed
+under the same GPL-3.0-or-later license.
+
+Build the DMG on a Mac:
+
+```sh
+SKIP_WRAP=1 SKIP_SIGN=1 SKIP_NOTARIZE=1 ./Installer/build_installer.sh
+```
+
 ## Downloads
 
 | Platform | Download | Included formats |

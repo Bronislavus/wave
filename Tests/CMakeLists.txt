@@ -30,7 +30,8 @@ add_executable(WavePublicEditorTests WavePublicEditorTests.cpp)
 target_include_directories(WavePublicEditorTests PRIVATE ../Source)
 target_link_libraries(WavePublicEditorTests PRIVATE WaveEmulation juce::juce_audio_utils)
 add_test(NAME WavePublicEditorTests COMMAND WavePublicEditorTests)
-set_tests_properties(WavePublicEditorTests PROPERTIES TIMEOUT 60)
+set_tests_properties(WavePublicEditorTests PROPERTIES TIMEOUT 60
+    ENVIRONMENT "WAVE_EDITOR_DESIGN_SIZE=1")
 
 if(WAVE_HAS_PRIVATE_ROMS)
     add_executable(WaveIntegrationTests WaveIntegrationTests.cpp)
@@ -87,7 +88,7 @@ if(WAVE_HAS_PRIVATE_ROMS)
         ENVIRONMENT "WAVE_FACTORY_SET=${CMAKE_SOURCE_DIR}/wave.set")
     set_tests_properties(WaveEditorTests WaveKeyboardButtonEditorTests WaveNumericKeypadEditorTests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-        ENVIRONMENT "WAVE_FACTORY_SET=${CMAKE_SOURCE_DIR}/wave.set")
+        ENVIRONMENT "WAVE_FACTORY_SET=${CMAKE_SOURCE_DIR}/wave.set;WAVE_EDITOR_DESIGN_SIZE=1")
 endif()
 
 # Developer tool: drives the real WDV.SYS from a script and prints the ASIC/CV

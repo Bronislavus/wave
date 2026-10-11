@@ -1,3 +1,7 @@
+// Modified 2026-10-11 by Bronisław Hońca (bronislawhonca.pl): the editor opens
+// at a size that fits the screen, remembers zoom and keyboard visibility, and
+// offers Fit to Screen. Licensed under GPL-3.0-or-later.
+
 #include "PluginEditor.h"
 
 #include "PanelWiring.h"
@@ -16,7 +20,7 @@ constexpr auto designWidth = 2338.0f;
 constexpr auto designHeight = 1042.0f;
 constexpr auto panelOnlyHeight = 619.0f;
 constexpr auto panelHorizontalOffset = 66.0f;
-constexpr auto minimumEditorScale = 0.5f;
+constexpr auto minimumEditorScale = 0.4f;
 constexpr auto maximumEditorScale = 2.0f;
 constexpr auto defaultEditorScale = 1.0f;
 constexpr auto keyboardLeft = 446.0f;
@@ -55,6 +59,7 @@ constexpr auto defaultPanelSkinMenuItem = 0x470d;
 constexpr auto reloadDiskBankMenuItem = 0x470e;
 constexpr auto createDiskFromWavetableMenuItem = 0x470f;
 constexpr auto compactPanelSkinMenuItem = 0x4710;
+constexpr auto fitToScreenMenuItem = 0x4711;
 
 const wave::ui::compact::Knob* compactKnobAt(juce::Point<float> originalPanelCentre)
 {
@@ -737,6 +742,7 @@ WaveEmulationAudioProcessorEditor::WaveEmulationAudioProcessorEditor(
     else if (const auto rememberedSkin = ownerProcessor.getRememberedPanelSkin();
              rememberedSkin != juce::File{})
         loadPanelSkin(rememberedSkin, false);
+    restoreWindowPreferences();
     startTimerHz(60);
     juce::MessageManager::callAsync([safe = juce::Component::SafePointer(this)] {
         if (safe != nullptr)
@@ -747,6 +753,8 @@ WaveEmulationAudioProcessorEditor::WaveEmulationAudioProcessorEditor(
 WaveEmulationAudioProcessorEditor::~WaveEmulationAudioProcessorEditor()
 {
     stopTimer();
+    if (windowSettings != nullptr)
+        windowSettings->saveIfNeeded();
     // Pitch Bend is the sole spring-loaded controller. Mod and the freely
     // assignable bipolar Free wheel retain their physical positions.
     if (activePerformanceWheel == 0)
@@ -796,6 +804,7 @@ juce::PopupMenu WaveEmulationAudioProcessorEditor::getMenuForIndex(
     menu.addItem(zoomInMenuItem, "Zoom In (Cmd/Ctrl + =)");
     menu.addItem(zoomOutMenuItem, "Zoom Out (Cmd/Ctrl + -)");
     menu.addItem(resetZoomMenuItem, "Actual Size (Cmd/Ctrl + 0)");
+    menu.addItem(fitToScreenMenuItem, "Fit to Screen (Cmd/Ctrl + Shift + 0)");
     menu.addItem(toggleKeyboardMenuItem,
                  keyboardVisible ? "Hide Lower Keyboard Area (Cmd/Ctrl + K)"
                                  : "Show Lower Keyboard Area (Cmd/Ctrl + K)", !compactSkin);
@@ -860,6 +869,11 @@ void WaveEmulationAudioProcessorEditor::menuItemSelected(int menuItemId, int)
         setWindowScale(defaultEditorScale);
         return;
     }
+    if (menuItemId == fitToScreenMenuItem)
+    {
+        setWindowScale(fitToScreenScale());
+        return;
+    }
     if (menuItemId == toggleKeyboardMenuItem)
     {
         setKeyboardVisible(!keyboardVisible);
@@ -912,11 +926,64 @@ void WaveEmulationAudioProcessorEditor::menuItemSelected(int menuItemId, int)
     }
 }
 
+float WaveEmulationAudioProcessorEditor::activeDesignHeight() const noexcept
+{
+    return compactSkin ? panelDesignHeight() : keyboardVisible ? designHeight : panelOnlyHeight;
+}
+
+float WaveEmulationAudioProcessorEditor::fitToScreenScale() const
+{
+    auto area = juce::Rectangle<int> { 1440, 900 };
+    const auto& displays = juce::Desktop::getInstance().getDisplays();
+    const auto* display = isShowing() ? displays.getDisplayForRect(getScreenBounds())
+                                      : displays.getPrimaryDisplay();
+    if (display != nullptr)
+        area = display->userBounds.toNearestInt();
+    // Leave room for the title bar, the standalone Options strip and a margin.
+    const auto scale = juce::jmin((static_cast<float>(area.getWidth()) - 40.0f) / panelDesignWidth(),
+                                  (static_cast<float>(area.getHeight()) - 110.0f)
+                                      / activeDesignHeight());
+    return juce::jlimit(minimumEditorScale, maximumEditorScale,
+                        std::floor(scale * 100.0f) / 100.0f);
+}
+
+void WaveEmulationAudioProcessorEditor::restoreWindowPreferences()
+{
+    // Editor tests address controls in design pixels and keep the original size.
+    if (juce::SystemStats::getEnvironmentVariable("WAVE_EDITOR_DESIGN_SIZE", {}).isNotEmpty())
+        return;
+    juce::PropertiesFile::Options options;
+    options.applicationName = "Wave Emulation UI";
+    options.filenameSuffix = ".settings";
+    options.folderName = "Wave Emulation";
+    options.osxLibrarySubFolder = "Application Support";
+    options.millisecondsBeforeSaving = 1000;
+    windowSettings = std::make_unique<juce::PropertiesFile>(options);
+
+    if (!compactSkin && !windowSettings->getBoolValue("keyboardVisible", true))
+        keyboardVisible = false;
+    const auto savedScale = static_cast<float>(windowSettings->getDoubleValue(
+        compactSkin ? "compactScale" : "editorScale", 0.0));
+    // First launch: fit the screen rather than opening wider than the display.
+    setWindowScale(savedScale > 0.0f ? savedScale
+                                     : juce::jmin(defaultEditorScale, fitToScreenScale()));
+    windowPreferencesRestored = true;
+}
+
+void WaveEmulationAudioProcessorEditor::saveWindowPreferences()
+{
+    if (!windowPreferencesRestored || windowSettings == nullptr || getWidth() <= 0)
+        return;
+    windowSettings->setValue(compactSkin ? "compactScale" : "editorScale",
+                             static_cast<double>(getWidth()) / panelDesignWidth());
+    if (!compactSkin)
+        windowSettings->setValue("keyboardVisible", keyboardVisible);
+}
+
 void WaveEmulationAudioProcessorEditor::setWindowScale(float scale)
 {
     scale = juce::jlimit(minimumEditorScale, maximumEditorScale, scale);
-    const auto activeHeight = compactSkin ? panelDesignHeight()
-                                          : keyboardVisible ? designHeight : panelOnlyHeight;
+    const auto activeHeight = activeDesignHeight();
     if (auto* constrainer = getConstrainer())
         constrainer->setFixedAspectRatio(static_cast<double>(panelDesignWidth() / activeHeight));
     setResizeLimits(juce::roundToInt(panelDesignWidth() * minimumEditorScale),
@@ -1131,9 +1198,10 @@ bool WaveEmulationAudioProcessorEditor::keyPressed(const juce::KeyPress& key)
             menuItemSelected(zoomOutMenuItem, 0);
             return true;
         }
-        if (code == '0' || code == juce::KeyPress::numberPad0)
+        if (code == '0' || code == ')' || code == juce::KeyPress::numberPad0)
         {
-            menuItemSelected(resetZoomMenuItem, 0);
+            menuItemSelected(key.getModifiers().isShiftDown() ? fitToScreenMenuItem
+                                                              : resetZoomMenuItem, 0);
             return true;
         }
         if (code == 'k')
@@ -2139,6 +2207,7 @@ void WaveEmulationAudioProcessorEditor::timerCallback()
 void WaveEmulationAudioProcessorEditor::resized()
 {
     rebuildPanelImage();
+    saveWindowPreferences();
     const auto scaleX = static_cast<float>(getWidth()) / panelDesignWidth();
     const auto scaleY = scaleX;
     const auto scaled = [scaleX, scaleY](juce::Rectangle<float> rectangle) {
