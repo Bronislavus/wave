@@ -49,7 +49,10 @@ public:
         float detuneCents = 0.0f;
         float gain = 1.0f;
         float auxGain = 0.0f;
-        int audioOutput = 0;
+        // Firmware "Audio Out" (Instrument part byte +0xC): 0 Aux only,
+        // 1 main, 2 sub 1, 3 sub 2. Only main reaches the plugin output.
+        static constexpr int mainAudioOut = 1;
+        int audioOutput = mainAudioOut;
         int keyLow = 0;
         int keyHigh = 127;
         int velocityLow = 1;
@@ -59,6 +62,9 @@ public:
         // temperaments: global, linear+, HMT, linear-, random 1..4,
         // user 1..4 and the MIDI Tuning Standard table.
         int tuningTable = 0;
+        // Native Instrument byte 15: dynamic, poly 1..16, last/low/high
+        // retrigger, then last/low/high single-trigger.
+        int allocationMode = 0;
         float performanceModWheel = -1.0f;
         float performanceChannelPressure = -1.0f;
         float performancePitchBend = -100.0f;
@@ -75,6 +81,15 @@ public:
         float outputDb = -7.0f;
         float circuitAgeAmount = 0.18f;
     };
+
+    // Phase-load code the WDV writes to the ASIC at key-on (OS 1.700 0xF92 for
+    // Wave 1, 0x1074 for Wave 2). `programmed` is Startphase (sound byte 27/43,
+    // 0 = free start), `storedAmount` the route amount byte (0..127, 64 = off)
+    // and `source` the 16-bit modulation word. Returns 0 for a free start
+    // (nothing is written), otherwise the byte the firmware sends: the sum is
+    // formed in 16-bit words, so Wave 1 wraps to 8 bits where Wave 2 saturates.
+    [[nodiscard]] static int startPhaseCode(int programmed, int storedAmount, int source,
+                                            bool secondOscillator) noexcept;
 
     struct VoiceProbe
     {
@@ -100,6 +115,7 @@ public:
         float glidePitch = 0.0f;
         bool active = false;
         bool keyDown = false;
+        float oscillator1FrequencyHz = 0.0f;
     };
 
     WaldorfEngine();
@@ -109,6 +125,9 @@ public:
     // Called by the host between render callbacks, while all card jobs are idle.
     void setAudioWorkgroup(const juce::AudioWorkgroup& workgroup) { audioWorkgroup = workgroup; }
     void reset();
+    // Physical buttons remain distinct even when their MIDI assignments coincide.
+    void setKeyboardButtons(bool button1, bool button2) noexcept;
+    void setKeyboardButtonControllers(int button1, int button2) noexcept;
     void render(juce::AudioBuffer<float>& output, const juce::MidiBuffer& midi,
                 const parameters::Snapshot& parameters);
     void render(juce::AudioBuffer<float>& output, const juce::MidiBuffer& midi,
@@ -122,6 +141,7 @@ public:
 
     [[nodiscard]] const WavetableBank& getWavetableBank() const noexcept { return wavetableBank; }
     bool loadWavetableRom(const juce::MemoryBlock& data) noexcept;
+    bool loadWaveFactoryRom(const juce::MemoryBlock& data);
     bool loadWaveSetUserTables(const juce::MemoryBlock& data) noexcept;
     void applyFirmwareHardwareWrite(int board, uint32_t address, uint8_t value) noexcept;
     void applyFirmwareHardwareWrite(uint32_t address, uint8_t value) noexcept
@@ -173,9 +193,11 @@ private:
                    bool glideDistanceMode,
                    bool glideQuantised, float inheritedGlideStepPerSample,
                    int inheritedGlideSamplesRemaining, float modWheel,
-                   float channelPressure, float pitchBend);
+                   float channelPressure, float pitchBend,
+                   bool retriggerEnvelopes = true);
         void release(bool allowSustain = true);
         void updatePitch(const parameters::Snapshot& parameters, float pitchBend);
+        [[nodiscard]] float baseFrequencyHz() const noexcept;
         [[nodiscard]] Cem3387::StereoSample process(const WavetableBank& bank,
                                                     const parameters::Snapshot& parameters,
                                                     float modWheel, float channelPressure,
@@ -219,6 +241,7 @@ private:
         OscillatorChipProxy oscillator2;
         AsicHighpassFilter highpassFilter;
         ReconstructionStage reconstruction;
+        AsicResampler asicResampler;
         Cem3387 circuit;
         WdvEnvelope envelope;
         WdvEnvelope filterEnvelope;
@@ -246,7 +269,6 @@ private:
         bool active = false;
         float currentWavePosition = 0.0f;
         std::array<float, 2> currentLfoValues{};
-        std::array<float, 2> waveStartOffsets{};
         std::array<float, 2> currentPitchModulations{};
         float currentGlideNote = 0.0f;
         float targetGlideNote = 0.0f;
@@ -286,7 +308,7 @@ private:
         int filterEnvelopeDelaySamples = 0;
         int vcaDrainSamplesRemaining = 0;
         int controlFilterMode = 0;
-        bool waveStartOffsetsPending = false;
+        bool startPhaseModPending = false;
         bool filterEnvelopePending = false;
         bool filterEnvelopeTriggered = false;
     };
@@ -297,6 +319,7 @@ private:
         float targetNote = 0.0f;
         float stepPerSample = 0.0f;
         int samplesRemaining = 0;
+        uint64_t triggerId = 0;
         bool initialised = false;
     };
 
@@ -331,9 +354,28 @@ private:
     void renderVoiceCard(int board, int sampleCount) noexcept;
     void startVoiceCardWorkers(double sampleRate, int maximumBlockSize);
     void stopVoiceCardWorkers() noexcept;
-    Voice& chooseVoice();
+    Voice* chooseVoice(int layer, const PerformanceSnapshot& performance);
+    struct HeldNote
+    {
+        int note = -1;
+        int channel = 0;
+        float velocity = 0.0f;
+        uint64_t trigger = 0;
+    };
+    struct HeldNotes
+    {
+        std::array<HeldNote, 256> notes{};
+        size_t count = 0;
+        void add(HeldNote note) noexcept;
+        void remove(uint64_t trigger) noexcept;
+        [[nodiscard]] const HeldNote* selected(int allocationMode) const noexcept;
+    };
+    void startLayerNote(const HeldNote& note, size_t layerIndex,
+                        const PerformanceSnapshot& performance,
+                        bool noteOnEvent);
 
     WavetableBank wavetableBank;
+    WavetableBank renderingWavetableBank;
     std::shared_ptr<const UserTuningBank> userTuningBank;
     std::array<Voice, voiceCount> voices;
     std::array<RenderingVoice, voiceCount> renderingVoices{};
@@ -356,8 +398,15 @@ private:
     float modWheelAmount = 0.0f;
     float channelPressureAmount = 0.0f;
     std::array<float, 128> midiControllerAmounts{};
+    std::array<int, 2> keyboardButtonControllers { 64, 1 };
+    std::array<int, 2> keyboardButtonStates {};
+    std::array<int, 2> appliedKeyboardButtonStates { -1, -1 };
+    std::array<std::array<float, 2>, 8> buttonAmountsByLayer {};
+    std::array<int, 8> buttonSourcesByLayer {};
     std::array<int, 8> lastPlayedNotesByLayer {};
     std::array<LayerGlideTrajectory, 8> layerGlideTrajectories {};
+    std::array<HeldNotes, 8> heldNotesByLayer{};
+    std::array<int, 8> allocationModesByLayer{};
     bool sustainPedal = false;
 };
 } // namespace wave::dsp

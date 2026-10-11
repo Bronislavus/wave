@@ -35,7 +35,11 @@ public:
     }
     bool installEditRecords(std::span<const uint8_t> sound,
                             std::span<const uint8_t> performance) noexcept;
+    bool installPerformanceBank(std::span<const uint8_t> performances) noexcept;
+    bool installSoundBank(std::span<const uint8_t> sounds) noexcept;
     bool requestPerformanceSelection(int programIndex) noexcept;
+    // Audio-thread preparation before the native keypad scanner runs.
+    void prepareNumericPanelInput() noexcept;
     bool refreshCurrentScreenFromFirmware()
     {
         return loaded && redrawCurrentScreenWithFirmware();
@@ -72,6 +76,7 @@ public:
                                          uint8_t data2) const noexcept;
     bool releasePanelEventLatch(int buttonId) noexcept;
     bool navigatePageWithFirmware(bool forwards) noexcept;
+    bool stepDiskMenuWithFirmware(bool forwards) noexcept;
     bool stepStoreDestinationWithFirmware(bool forwards) noexcept;
     [[nodiscard]] bool panelActionBitActive(int buttonId) const noexcept;
     bool releasePanelActionBit(int buttonId) noexcept;
@@ -117,9 +122,18 @@ public:
     [[nodiscard]] uint8_t ioByte(uint32_t address) const noexcept;
     [[nodiscard]] uint8_t localByte(uint32_t address) const noexcept;
     [[nodiscard]] uint8_t sharedProgramByte(uint32_t offset) const noexcept;
+    // A queued recall has no committed ID yet; its live LCD frame stays valid.
+    // Audio-thread recall scheduling: keep each parser transaction intact
+    // until its completed display has been published.
+    [[nodiscard]] bool performanceSelectionPending() const noexcept
+    {
+        return pendingPerformanceRefresh >= 0;
+    }
     [[nodiscard]] std::optional<int> currentPerformanceId() const noexcept;
     [[nodiscard]] std::optional<uint32_t> currentPerformanceRecordOffset() const noexcept;
     [[nodiscard]] std::optional<int> currentPerformanceInstrument() const noexcept;
+    [[nodiscard]] std::optional<int> currentInstrumentEditTarget() const noexcept;
+    [[nodiscard]] std::optional<int> currentInstrumentEditPage() const noexcept;
     [[nodiscard]] std::optional<uint32_t> currentSoundRecordOffset() const noexcept;
     [[nodiscard]] std::optional<uint32_t> performanceInstrumentSoundRecordOffset(
         int instrument) const noexcept;
@@ -140,6 +154,12 @@ public:
     [[nodiscard]] bool panelButtonRequestedDown(int buttonId) const noexcept;
     [[nodiscard]] uint8_t lcdVideoByte(uint32_t offset) const noexcept;
     [[nodiscard]] uint8_t lcdDisplayPage() const noexcept;
+    // Changes when the visible source switches between a held recall frame
+    // and live VRAM, even if that switch performs no additional VRAM write.
+    [[nodiscard]] uint64_t lcdDisplayRevision() const noexcept
+    {
+        return lcdPresentationRevision.load(std::memory_order_acquire);
+    }
     [[nodiscard]] uint64_t lcdVideoWriteCount() const noexcept
     {
         return lcdWrites.load(std::memory_order_relaxed);
@@ -161,13 +181,14 @@ public:
     static constexpr uint32_t sharedProgramSize = SharedFirmwareMemory::programSize;
     static constexpr uint32_t sharedWorkBase = 0x140000;
     static constexpr uint32_t sharedWorkSize = SharedFirmwareMemory::workSize;
-    static constexpr uint32_t sharedExtensionBase = 0x180000;
     static constexpr uint32_t lcdVideoBase = 0xa00000;
     static constexpr uint32_t lcdVideoWindowSize = 0x4000;
     using LcdVideoSnapshot = std::array<uint8_t, lcdVideoWindowSize>;
     [[nodiscard]] LcdVideoSnapshot lcdVideoSnapshot() const noexcept;
 
 private:
+    bool runPanelCallbacksWithFirmware(uint32_t callbackTable) noexcept;
+    bool appendPanelEventToFirmwareRing(const std::array<uint8_t, 3>& event) noexcept;
     struct VirtualInitialisationFile
     {
         bool open = false;
@@ -200,8 +221,9 @@ private:
     void write8(uint32_t address, uint8_t value) noexcept override;
     [[nodiscard]] bool usesInstructionInterception() const noexcept override
     {
-        return initialisationLoaderActive || startupContinuationActive
-               || displayRefreshActive;
+        return pendingPanelEventCount != 0 || initialisationLoaderActive || startupContinuationActive
+               || displayRefreshActive || pendingPerformanceRefresh >= 0
+               || internalPerformanceDispatch;
     }
     bool interceptInstruction(M68000& activeCpu, uint32_t programCounter) noexcept override;
     bool redrawCurrentScreenWithFirmware();
@@ -214,7 +236,10 @@ private:
     SharedFirmwareMemory ownedSharedMemory;
     SharedFirmwareMemory* sharedMemory = &ownedSharedMemory;
     std::array<std::atomic<uint8_t>, lcdVideoWindowSize> lcdVideoRam{};
+    std::atomic<uint64_t> lcdPresentationRevision{ 0 };
     std::array<std::atomic<uint16_t>, 8> panelSwitchWords{};
+    std::array<std::array<uint8_t, 3>, 256> pendingPanelEvents {};
+    size_t pendingPanelEventCount = 0;
     std::array<std::atomic<uint64_t>, 128> panelReleaseCycles{};
     std::array<std::atomic<bool>, 128> panelReleasePending{};
     std::array<std::atomic<bool>, 128> panelButtonRequested{};
@@ -245,6 +270,12 @@ private:
     bool displayRefreshActive = false;
     bool displayRefreshComplete = false;
     int pendingPerformanceRefresh = -1;
+    std::array<std::atomic<uint8_t>, lcdVideoWindowSize> pendingPerformanceDisplay{};
+    std::atomic<uint8_t> pendingPerformanceDisplayPage { 0 };
+    std::atomic<bool> pendingPerformanceDisplayFrozen { false };
+    uint32_t pendingPerformanceMidiAddress = 0;
+    bool internalPerformanceDispatch = false;
+    bool pendingPerformanceSelectionHandled = false;
     bool voiceLoaderReached = false;
     bool customInitialisationRecords = false;
     bool voiceBoardHandoffComplete = false;

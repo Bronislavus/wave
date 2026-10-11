@@ -25,6 +25,27 @@ constexpr uint32_t osFileClose = 0x02d234;
 constexpr uint32_t osFileRead = 0x02d23a;
 constexpr uint16_t initSoundHandle = 0x7001;
 constexpr uint16_t initPerformanceHandle = 0x7002;
+
+class ScopedDisplayTextBuffer
+{
+public:
+    explicit ScopedDisplayTextBuffer(SharedFirmwareMemory& memory) noexcept
+        : text(memory.mainRam.data() + 0x56000u)
+    {
+        std::copy_n(text, saved.size(), saved.begin());
+    }
+
+    ~ScopedDisplayTextBuffer()
+    {
+        std::copy(saved.begin(), saved.end(), text);
+    }
+
+private:
+    // OS 1.700 shares this formatting workspace with Store's name editor.
+    // The panel dispatch table begins immediately after it at $56070.
+    uint8_t* text;
+    std::array<uint8_t, 0x70> saved{};
+};
 } // namespace
 
 void MasterFirmwareRuntime::Acia6850::reset() noexcept
@@ -81,14 +102,20 @@ void MasterFirmwareRuntime::Acia6850::pushReceive(uint8_t value) noexcept
 bool MasterFirmwareRuntime::loadAndStart(const juce::MemoryBlock& masterImage)
 {
     loaded = false;
+    pendingPanelEventCount = 0;
     if (sharedMemory == &ownedSharedMemory)
         sharedMemory->clear();
     else
         sharedMemory->mainRam.fill(0);
     for (auto& byte : lcdVideoRam)
         byte.store(0, std::memory_order_relaxed);
-    for (auto& word : panelSwitchWords)
-        word.store(0xffffu, std::memory_order_relaxed);
+    // The first six banks are active-low switches. The last two are
+    // quadrature encoder inputs, whose idle phase must match the firmware's
+    // zero-initialised previous-phase words at $5520C. Starting those banks
+    // high makes the scanner generate a -1 step for every encoder at boot.
+    for (size_t bank = 0; bank < panelSwitchWords.size(); ++bank)
+        panelSwitchWords[bank].store(bank < 6 ? 0xffffu : 0x0000u,
+                                    std::memory_order_relaxed);
     for (auto& cycle : panelReleaseCycles)
         cycle.store(0, std::memory_order_relaxed);
     for (auto& pending : panelReleasePending)
@@ -124,6 +151,11 @@ bool MasterFirmwareRuntime::loadAndStart(const juce::MemoryBlock& masterImage)
     displayRefreshActive = false;
     displayRefreshComplete = false;
     pendingPerformanceRefresh = -1;
+    pendingPerformanceDisplayFrozen.store(false, std::memory_order_release);
+    lcdPresentationRevision.fetch_add(1, std::memory_order_release);
+    pendingPerformanceMidiAddress = 0;
+    internalPerformanceDispatch = false;
+    pendingPerformanceSelectionHandled = false;
     voiceLoaderReached = false;
     voiceBoardHandoffComplete = false;
     activeVoiceBoardCount = 0;
@@ -216,33 +248,70 @@ bool MasterFirmwareRuntime::installEditRecords(
     return true;
 }
 
+bool MasterFirmwareRuntime::installSoundBank(
+    std::span<const uint8_t> sounds) noexcept
+{
+    constexpr size_t editableBank = 0x8000u;
+    constexpr size_t storedBank = 0x18000u;
+    constexpr size_t bankBytes = 256u * 256u;
+    if (!loaded || sounds.size() != bankBytes
+        || storedBank + bankBytes > sharedMemory->program.size())
+        return false;
+
+    // The OS can resolve a Sound through either bank according to its edit
+    // registry. Populate both from the loaded SET so the native browser and
+    // subsequent selection see the same 256 distinct programs as the engine.
+    std::copy(sounds.begin(), sounds.end(),
+              sharedMemory->program.begin() + editableBank);
+    std::copy(sounds.begin(), sounds.end(),
+              sharedMemory->program.begin() + storedBank);
+    return true;
+}
+
+bool MasterFirmwareRuntime::installPerformanceBank(
+    std::span<const uint8_t> performances) noexcept
+{
+    constexpr uint32_t bankOffset = 0x28000u;
+    constexpr size_t bankBytes = 256u * 512u;
+    if (!loaded || sharedMemory == nullptr || performances.size() != bankBytes)
+        return false;
+
+    // The native bank at $128000 crosses into work SRAM at $140000.
+    for (size_t index = 0; index < bankBytes; ++index)
+        write8(sharedProgramBase + bankOffset + static_cast<uint32_t>(index),
+               performances[index]);
+    return true;
+}
+
 bool MasterFirmwareRuntime::requestPerformanceSelection(int programIndex) noexcept
 {
     if (!loaded || programIndex < 0 || programIndex >= 256)
         return false;
 
-    // OS 1.700's MIDI program-change handler combines the 7-bit program
-    // number with bit 0 of this genuine system-work byte (see $008B3C-$008B52)
-    // before calling the firmware's performance-selection routine.  Feeding
-    // the request through that handler is important: merely replacing the
-    // edit records leaves the OS's selected-performance state and its LCD
-    // callbacks pointing at the previous program.
-    constexpr uint32_t performanceBankOffset = 0x8820u;
-    auto& bank = sharedMemory->work[performanceBankOffset];
-    bank = static_cast<uint8_t>((bank & 0xfeu) | ((programIndex / 128) & 0x01));
-
-    // A request may deliberately reselect the same program number after its
-    // backing bank has changed (for example, cold-start A001 after a disk
-    // Total Recall). Do not let runCycles mistake the old matching number for
-    // completion before OS 1.700 has consumed the MIDI event and installed
-    // the new bank's display callbacks/data.
-    constexpr uint32_t selectedPerformanceAddress = 0x54b40u;
-    sharedMemory->mainRam[selectedPerformanceAddress] = 0xffu;
-    sharedMemory->mainRam[selectedPerformanceAddress + 1u] = 0xffu;
-
-    pushMidiByte(0, 0xc0u);
-    pushMidiByte(0, static_cast<uint8_t>(programIndex & 0x7f));
+    if (!pendingPerformanceDisplayFrozen.load(std::memory_order_acquire))
+    {
+        const auto frame = lcdVideoSnapshot();
+        for (size_t index = 0; index < frame.size(); ++index)
+            pendingPerformanceDisplay[index].store(frame[index], std::memory_order_relaxed);
+        pendingPerformanceDisplayPage.store(lcdDisplayPage(), std::memory_order_relaxed);
+        pendingPerformanceDisplayFrozen.store(true, std::memory_order_release);
+        lcdPresentationRevision.fetch_add(1, std::memory_order_release);
+    }
+    // Feed panel/host recall through the normal OS parser, tagging its data
+    // byte so external MIDI routing/maps cannot redirect this internal request.
+    // Keep the live selected ID valid until the OS installs the new one.
+    auto& bank = sharedMemory->work[0x8820u];
+    bank = static_cast<uint8_t>((bank & 0xfeu) | ((programIndex / 128) & 1));
     pendingPerformanceRefresh = programIndex;
+    pendingPerformanceSelectionHandled = false;
+    pushMidiByte(0, 0xc0u);
+    constexpr uint32_t writePointerAddress = 0x4dda4u;
+    const auto& ram = sharedMemory->mainRam;
+    pendingPerformanceMidiAddress = (static_cast<uint32_t>(ram[writePointerAddress]) << 24u)
+        | (static_cast<uint32_t>(ram[writePointerAddress + 1u]) << 16u)
+        | (static_cast<uint32_t>(ram[writePointerAddress + 2u]) << 8u)
+        | ram[writePointerAddress + 3u];
+    pushMidiByte(0, static_cast<uint8_t>(programIndex & 0x7f));
     return true;
 }
 
@@ -267,6 +336,10 @@ bool MasterFirmwareRuntime::redrawCurrentScreenWithFirmware()
     // Its temporary stack occupies the Wave's reserved upper stack area and is
     // restored afterwards, leaving the continuously running OS CPU untouched.
     // All display writes and all drawing decisions still come from w2sys.bin.
+    // The main CPU may be suspended between selecting a Store destination
+    // and copying its edited name. Drawing fader labels uses the same text
+    // buffer, so preserve it as well as the stack during this extra redraw.
+    const ScopedDisplayTextBuffer preserveText(*sharedMemory);
     std::array<uint8_t, localRamSize - temporaryStackBottom> savedStack{};
     std::copy(ram.begin() + temporaryStackBottom, ram.end(), savedStack.begin());
     ram[temporaryStackPointer] = static_cast<uint8_t>(returnSentinel >> 24u);
@@ -282,7 +355,34 @@ bool MasterFirmwareRuntime::redrawCurrentScreenWithFirmware()
         displayCpu.execute(*this, 50000);
     displayRefreshActive = false;
     std::copy(savedStack.begin(), savedStack.end(), ram.begin() + temporaryStackBottom);
+    if (displayRefreshComplete)
+        prepareNumericPanelInput();
     return displayRefreshComplete;
+}
+
+void MasterFirmwareRuntime::prepareNumericPanelInput() noexcept
+{
+    if (!loaded || sharedMemory == nullptr)
+        return;
+    auto& ram = sharedMemory->mainRam;
+    const auto readLong = [&ram](uint32_t address) {
+        return bigEndian32(ram.data() + address);
+    };
+    if (ram[0x56f4au] != 0 && readLong(0x56bb0u) == 0x0189c4u
+        && readLong(0x57030u) == 0x01ce84u
+        && readLong(0x56728u) == 0x01ce84u
+        && readLong(0x56738u) == 0x01ce84u)
+    {
+        // Performance has restored the OS's inert Manager and response
+        // callbacks, but a preceding disk workspace can leave its active flag
+        // behind. $1CBDC then sends completed numbers to the inert callback.
+        // Retire that orphaned ownership and any entry made into it. Genuine
+        // numeric entry and requesters install other callbacks and stay intact.
+        ram[0x56f4au] = 0;
+        ram[0x58f73u] = 0;
+        ram[0x58f74u] = 0;
+        ram[0x58f76u] = 0;
+    }
 }
 
 bool MasterFirmwareRuntime::navigatePageWithFirmware(bool forwards) noexcept
@@ -295,8 +395,36 @@ bool MasterFirmwareRuntime::navigatePageWithFirmware(bool forwards) noexcept
     // scheduler, which makes a host mouse click liable either to be missed or
     // to repeat several times inside one audio block. Run the callbacks that
     // the current screen installed, in their exact firmware order, once.
-    constexpr uint32_t backwardsCallbacks = 0x56698u;
-    constexpr uint32_t forwardsCallbacks = 0x566a8u;
+    const auto completed = runPanelCallbacksWithFirmware(forwards ? 0x566a8u : 0x56698u);
+    sharedMemory->mainRam[0x59890u] = 0u;
+    releasePanelEventLatch(21);
+    releasePanelEventLatch(23);
+    return completed;
+}
+
+bool MasterFirmwareRuntime::stepDiskMenuWithFirmware(bool forwards) noexcept
+{
+    if (!loaded || sharedMemory == nullptr)
+        return false;
+    const auto code = forwards ? 72u : 69u;
+    const auto action = sharedMemory->mainRam[0x2850eu + code];
+    const auto callbacks = 0x56618u + static_cast<uint32_t>(action) * 16u;
+    const auto& ram = sharedMemory->mainRam;
+    const auto callback = (static_cast<uint32_t>(ram[callbacks]) << 24u)
+                          | (static_cast<uint32_t>(ram[callbacks + 1u]) << 16u)
+                          | (static_cast<uint32_t>(ram[callbacks + 2u]) << 8u)
+                          | ram[callbacks + 3u];
+    // OS menu selectors do not arm the +/- repeat latch. Calling their
+    // installed selector once avoids mistaking successful input for a retry.
+    if (callback != (forwards ? 0x2dcaau : 0x2dce6u))
+        return false;
+    discardPendingPanelButtonEvents(static_cast<int>(code));
+    releasePanelEventLatch(static_cast<int>(code));
+    return runPanelCallbacksWithFirmware(callbacks);
+}
+
+bool MasterFirmwareRuntime::runPanelCallbacksWithFirmware(uint32_t callbackTable) noexcept
+{
     constexpr uint32_t displayService = 0x0010b6u;
     constexpr uint32_t temporaryStackBottom = 0x0f0000u;
     constexpr uint32_t trampolineAddress = temporaryStackBottom + 0x10u;
@@ -309,7 +437,6 @@ bool MasterFirmwareRuntime::navigatePageWithFirmware(bool forwards) noexcept
                | (static_cast<uint32_t>(ram[address + 2u]) << 8u)
                | static_cast<uint32_t>(ram[address + 3u]);
     };
-    const auto callbackTable = forwards ? forwardsCallbacks : backwardsCallbacks;
     const std::array entries { readLong(callbackTable), displayService,
                                readLong(callbackTable + 4u), displayService };
     for (const auto entry : entries)
@@ -346,12 +473,6 @@ bool MasterFirmwareRuntime::navigatePageWithFirmware(bool forwards) noexcept
     displayRefreshActive = false;
     std::copy(savedStack.begin(), savedStack.end(), ram.begin() + temporaryStackBottom);
 
-    // Both page keys are electrically released after the one-shot callback.
-    // This also recovers an emulator session left in the firmware's Help-key
-    // chord state by an earlier interrupted click.
-    ram[0x59890u] = 0u;
-    releasePanelEventLatch(21);
-    releasePanelEventLatch(23);
     return displayRefreshComplete;
 }
 
@@ -441,6 +562,7 @@ bool MasterFirmwareRuntime::redrawPerformanceFaderWithFirmware(int faderIndex)
     // $18D6C is the handler that OS 1.700 installs for each of the eight
     // Performance faders. Invoke that genuine routine with D0 equal to the
     // fader index; it chooses and rasterises the displayed value itself.
+    const ScopedDisplayTextBuffer preserveText(*sharedMemory);
     std::array<uint8_t, localRamSize - temporaryStackBottom> savedStack{};
     std::copy(ram.begin() + temporaryStackBottom, ram.end(), savedStack.begin());
     ram[temporaryStackPointer] = static_cast<uint8_t>(returnSentinel >> 24u);
@@ -504,7 +626,32 @@ bool MasterFirmwareRuntime::runOs1700InitialisationFileLoad()
 bool MasterFirmwareRuntime::interceptInstruction(M68000& activeCpu,
                                                  uint32_t programCounter) noexcept
 {
+    // Both switch and ADC scanners hold their producer cursor in A5 while
+    // running. Appending while the CPU is paused inside a scanner lets its
+    // final stale cursor overwrite the host event. Deliver only at the native
+    // consumer entry, after the producer has committed its cursor.
+    if (programCounter == 0x00468eu && pendingPanelEventCount != 0)
+    {
+        size_t delivered = 0;
+        while (delivered < pendingPanelEventCount
+               && appendPanelEventToFirmwareRing(pendingPanelEvents[delivered]))
+            ++delivered;
+        for (size_t i = delivered; i < pendingPanelEventCount; ++i)
+            pendingPanelEvents[i - delivered] = pendingPanelEvents[i];
+        pendingPanelEventCount -= delivered;
+    }
     constexpr uint32_t displayRefreshReturnSentinel = 0x0f0000u;
+    // The MIDI parser copies the packet to $514D0 before dispatch, but A2
+    // retains its input-ring cursor just past the consumed data byte. Only
+    // the specifically tagged internal event bypasses external MIDI settings.
+    if (programCounter == 0x008ac4u)
+        internalPerformanceDispatch = pendingPerformanceRefresh >= 0
+            && activeCpu.addressRegister(2) == pendingPerformanceMidiAddress + 1u;
+    if (programCounter == 0x008b58u && internalPerformanceDispatch)
+    {
+        internalPerformanceDispatch = false;
+    }
+
     if (displayRefreshActive && programCounter == displayRefreshReturnSentinel)
     {
         displayRefreshComplete = true;
@@ -648,10 +795,14 @@ int MasterFirmwareRuntime::runCycles(int cycles)
                                    << 8)
                                   | static_cast<int>(sharedMemory->mainRam[
                                       selectedPerformanceAddress + 1u]);
-            if (selected == pendingPerformanceRefresh)
+            if (pendingPerformanceSelectionHandled && selected == pendingPerformanceRefresh)
             {
-                redrawCurrentScreenWithFirmware();
-                pendingPerformanceRefresh = -1;
+                if (redrawCurrentScreenWithFirmware())
+                {
+                    pendingPerformanceRefresh = -1;
+                    pendingPerformanceDisplayFrozen.store(false, std::memory_order_release);
+                    lcdPresentationRevision.fetch_add(1, std::memory_order_release);
+                }
             }
         }
 
@@ -769,7 +920,10 @@ uint8_t MasterFirmwareRuntime::localByte(uint32_t address) const noexcept
 
 uint8_t MasterFirmwareRuntime::sharedProgramByte(uint32_t offset) const noexcept
 {
-    return offset < sharedMemory->program.size() ? sharedMemory->program[offset] : 0xffu;
+    if (offset < sharedMemory->program.size())
+        return sharedMemory->program[offset];
+    offset -= static_cast<uint32_t>(sharedMemory->program.size());
+    return offset < sharedMemory->work.size() ? sharedMemory->work[offset] : 0xffu;
 }
 
 bool MasterFirmwareRuntime::writePerformanceInstrumentByte(
@@ -786,15 +940,13 @@ bool MasterFirmwareRuntime::writePerformanceInstrumentByte(
     const auto address = *performance + instrumentTable
                          + static_cast<uint32_t>(instrument) * instrumentRecordSize
                          + offset;
-    if (address >= sharedMemory->program.size())
-        return false;
-    sharedMemory->program[address] = value;
+    write8(sharedProgramBase + address, value);
     return true;
 }
 
 std::optional<int> MasterFirmwareRuntime::currentPerformanceId() const noexcept
 {
-    if (!loaded || sharedMemory == nullptr)
+    if (!loaded || sharedMemory == nullptr || pendingPerformanceRefresh >= 0)
         return std::nullopt;
 
     constexpr uint32_t address = 0x54b40u;
@@ -807,12 +959,11 @@ std::optional<int> MasterFirmwareRuntime::currentPerformanceId() const noexcept
 std::optional<int> MasterFirmwareRuntime::currentPerformanceInstrument() const noexcept
 {
     const auto performanceOffset = currentPerformanceRecordOffset();
-    if (!performanceOffset.has_value() || sharedMemory == nullptr
-        || *performanceOffset + 24u >= sharedMemory->program.size())
+    if (!performanceOffset.has_value() || sharedMemory == nullptr)
         return std::nullopt;
 
     return static_cast<int>(
-        sharedMemory->program[*performanceOffset + 24u] & 0x0fu);
+        sharedProgramByte(*performanceOffset + 24u) & 0x0fu);
 }
 
 std::optional<uint32_t>
@@ -838,13 +989,42 @@ MasterFirmwareRuntime::currentPerformanceRecordOffset() const noexcept
                   == readProgramWord(specialPerformanceIdOffset)
               ? specialPerformanceOffset
               : performanceBankOffset
-                    + static_cast<uint32_t>(*performanceId) * 0x200u;
-    if (performanceOffset + 0x200u > program.size()
-        || program[performanceOffset + 48u] != 0x55u)
+                    + (static_cast<uint32_t>(*performanceId) & 0xffu) * 0x200u;
+    if (sharedProgramByte(performanceOffset + 48u) != 0x55u)
         performanceOffset = fallbackPerformanceOffset;
-    if (performanceOffset + 0x200u > program.size())
-        return std::nullopt;
     return performanceOffset;
+}
+
+std::optional<int> MasterFirmwareRuntime::currentInstrumentEditTarget() const noexcept
+{
+    if (!loaded || sharedMemory == nullptr)
+        return std::nullopt;
+    // OS 1.700's Instrument Edit fader handler ($14122) reads this page
+    // target. Performance byte 24 can change when an Instrument is disabled
+    // or its Performance is promoted to the edit buffer.
+    // Group Edit reuses that byte as a parameter selector ($14142), so it
+    // retains the Performance's selected Instrument for single-layer feedback.
+    if (sharedMemory->mainRam[0x56ed8u] != 0u)
+        return currentPerformanceInstrument();
+    const auto target = static_cast<int>(sharedMemory->mainRam[0x56eeau]);
+    return target < 8 ? std::optional<int>(target) : std::nullopt;
+}
+
+std::optional<int> MasterFirmwareRuntime::currentInstrumentEditPage() const noexcept
+{
+    if (!loaded || sharedMemory == nullptr)
+        return std::nullopt;
+    const auto& ram = sharedMemory->mainRam;
+    const auto callback = (static_cast<uint32_t>(ram[0x56bb0u]) << 24u)
+                          | (static_cast<uint32_t>(ram[0x56bb1u]) << 16u)
+                          | (static_cast<uint32_t>(ram[0x56bb2u]) << 8u)
+                          | ram[0x56bb3u];
+    // OS 1.700's Instrument renderer $13F78 uses this persistent page index.
+    // Re-entering Instrument Edit preserves it; the mode key does not reset
+    // it. Group/External Edit have different fader destinations.
+    if (callback != 0x13f78u || ram[0x56ee8u] != 0x49u || ram[0x56ed8u] != 0u)
+        return std::nullopt;
+    return static_cast<int>(ram[0x56ee9u] & 3u);
 }
 
 std::optional<uint32_t> MasterFirmwareRuntime::currentSoundRecordOffset() const noexcept
@@ -862,7 +1042,6 @@ MasterFirmwareRuntime::performanceInstrumentSoundRecordOffset(
     if (!loaded || sharedMemory == nullptr)
         return std::nullopt;
 
-    const auto& ram = sharedMemory->mainRam;
     const auto& program = sharedMemory->program;
     const auto readProgramWord = [&program](uint32_t offset) {
         if (offset + 1u >= program.size())
@@ -874,11 +1053,6 @@ MasterFirmwareRuntime::performanceInstrumentSoundRecordOffset(
     // These are the same record-resolution tables used by OS 1.700 at
     // $A8A2/$A8D4/$AE38/$AB7C. The firmware edits the selected Instrument's
     // live Sound record, which is not necessarily the $5300 startup record.
-    constexpr uint32_t currentPerformanceAddress = 0x54b40u;
-    constexpr uint32_t specialPerformanceIdOffset = 0x5184u;
-    constexpr uint32_t specialPerformanceOffset = 0x5600u;
-    constexpr uint32_t fallbackPerformanceOffset = 0x5400u;
-    constexpr uint32_t performanceBankOffset = 0x28000u;
     constexpr uint32_t soundCacheIdsOffset = 0x5186u;
     constexpr uint32_t soundRegistryOffset = 0x5200u;
     constexpr uint32_t soundCacheOffset = 0x5800u;
@@ -887,17 +1061,10 @@ MasterFirmwareRuntime::performanceInstrumentSoundRecordOffset(
     constexpr uint32_t fallbackSoundOffset = 0x5300u;
     constexpr uint32_t soundRecordSize = 0x100u;
 
-    const auto performanceId = static_cast<uint16_t>(
-        (static_cast<uint16_t>(ram[currentPerformanceAddress]) << 8u)
-        | ram[currentPerformanceAddress + 1u]);
-    auto performanceOffset
-        = performanceId == readProgramWord(specialPerformanceIdOffset)
-              ? specialPerformanceOffset
-              : performanceBankOffset
-                    + static_cast<uint32_t>(performanceId) * 0x200u;
-    if (performanceOffset + 0x200u > program.size()
-        || program[performanceOffset + 48u] != 0x55u)
-        performanceOffset = fallbackPerformanceOffset;
+    const auto performance = currentPerformanceRecordOffset();
+    if (!performance.has_value())
+        return std::nullopt;
+    const auto performanceOffset = *performance;
 
     if (requestedInstrument < 0 || requestedInstrument >= 8)
         return std::nullopt;
@@ -906,11 +1073,9 @@ MasterFirmwareRuntime::performanceInstrumentSoundRecordOffset(
         = instrument < 8u
               ? performanceOffset + 64u + instrument * 32u
               : performanceOffset + 64u + 256u + (instrument & 7u) * 24u;
-    if (instrumentOffset + 2u > program.size())
-        return std::nullopt;
     const auto soundId = static_cast<uint32_t>(
-        (static_cast<uint32_t>(program[instrumentOffset + 1u]) << 7u
-         | static_cast<uint32_t>(program[instrumentOffset]))
+        (static_cast<uint32_t>(sharedProgramByte(instrumentOffset + 1u)) << 7u
+         | static_cast<uint32_t>(sharedProgramByte(instrumentOffset)))
         & 0xffu);
 
     for (int slot = 7; slot >= 0; --slot)
@@ -978,11 +1143,11 @@ bool MasterFirmwareRuntime::installCurrentPerformanceRecord(
     std::span<const uint8_t, 512> performance) noexcept
 {
     const auto record = currentPerformanceRecordOffset();
-    if (!record.has_value() || sharedMemory == nullptr
-        || *record + performance.size() > sharedMemory->program.size())
+    if (!record.has_value() || sharedMemory == nullptr)
         return false;
-    std::copy(performance.begin(), performance.end(),
-              sharedMemory->program.begin() + *record);
+    for (size_t index = 0; index < performance.size(); ++index)
+        write8(sharedProgramBase + *record + static_cast<uint32_t>(index),
+               performance[index]);
     return true;
 }
 
@@ -1025,27 +1190,40 @@ uint8_t MasterFirmwareRuntime::lcdVideoByte(uint32_t offset) const noexcept
 MasterFirmwareRuntime::LcdVideoSnapshot MasterFirmwareRuntime::lcdVideoSnapshot() const noexcept
 {
     LcdVideoSnapshot snapshot{};
-    for (size_t index = 0; index < lcdVideoRam.size(); ++index)
-        snapshot[index] = lcdVideoRam[index].load(std::memory_order_relaxed);
+    const auto frozen = pendingPerformanceDisplayFrozen.load(std::memory_order_acquire);
+    const auto& source = frozen ? pendingPerformanceDisplay : lcdVideoRam;
+    for (size_t index = 0; index < source.size(); ++index)
+        snapshot[index] = source[index].load(std::memory_order_relaxed);
     return snapshot;
 }
 
 uint8_t MasterFirmwareRuntime::lcdDisplayPage() const noexcept
 {
-    return lcdPage.load(std::memory_order_relaxed);
+    return pendingPerformanceDisplayFrozen.load(std::memory_order_acquire)
+        ? pendingPerformanceDisplayPage.load(std::memory_order_relaxed)
+        : lcdPage.load(std::memory_order_relaxed);
 }
 
 uint8_t MasterFirmwareRuntime::read8(uint32_t address) noexcept
 {
+    if (pendingPerformanceRefresh >= 0 && !pendingPerformanceSelectionHandled
+        && (address == 0x54b40u || address == 0x54b41u))
+        // Preserve the OS's no-selection recall phase without storing an
+        // invalid ID in SRAM. The LCD publishes the completed frame only.
+        return 0xffu;
+
+    if (internalPerformanceDispatch
+        && (address == sharedWorkBase + 0x8824u // MIDI program reception mode.
+            || address == sharedWorkBase + 0x880du // External receive channel.
+            || address == sharedWorkBase + 0x8806u)) // External program map.
+        return 0u;
+
     if (address < sharedMemory->mainRam.size())
         return sharedMemory->mainRam[address];
     if (address >= sharedProgramBase && address < sharedProgramBase + sharedMemory->program.size())
         return sharedMemory->program[address - sharedProgramBase];
     if (address >= sharedWorkBase && address < sharedWorkBase + sharedMemory->work.size())
         return sharedMemory->work[address - sharedWorkBase];
-    if (address >= sharedExtensionBase
-        && address < sharedExtensionBase + sharedMemory->extension.size())
-        return sharedMemory->extension[address - sharedExtensionBase];
     if (address >= lcdVideoBase && address < lcdVideoBase + lcdVideoRam.size())
         return lcdVideoRam[address - lcdVideoBase].load(std::memory_order_relaxed);
 
@@ -1117,6 +1295,8 @@ void MasterFirmwareRuntime::write8(uint32_t address, uint8_t value) noexcept
     if (address < sharedMemory->mainRam.size())
     {
         sharedMemory->mainRam[address] = value;
+        if (address == 0x54b41u && internalPerformanceDispatch)
+            pendingPerformanceSelectionHandled = true;
         return;
     }
     if (address >= sharedProgramBase && address < sharedProgramBase + sharedMemory->program.size())
@@ -1127,12 +1307,6 @@ void MasterFirmwareRuntime::write8(uint32_t address, uint8_t value) noexcept
     if (address >= sharedWorkBase && address < sharedWorkBase + sharedMemory->work.size())
     {
         sharedMemory->work[address - sharedWorkBase] = value;
-        return;
-    }
-    if (address >= sharedExtensionBase
-        && address < sharedExtensionBase + sharedMemory->extension.size())
-    {
-        sharedMemory->extension[address - sharedExtensionBase] = value;
         return;
     }
     if (address >= lcdVideoBase && address < lcdVideoBase + lcdVideoRam.size())
@@ -1387,8 +1561,15 @@ void MasterFirmwareRuntime::setPerformanceFaderValue(int faderIndex,
 void MasterFirmwareRuntime::pushPanelEvent(uint8_t status, uint8_t data1,
                                            uint8_t data2) noexcept
 {
+    if (loaded && pendingPanelEventCount < pendingPanelEvents.size())
+        pendingPanelEvents[pendingPanelEventCount++] = { status, data1, data2 };
+}
+
+bool MasterFirmwareRuntime::appendPanelEventToFirmwareRing(
+    const std::array<uint8_t, 3>& event) noexcept
+{
     if (sharedMemory == nullptr)
-        return;
+        return false;
 
     // The panel scanner writes fixed three-byte records into this genuine OS
     // ring. $468E consumes them as status, control number and value/delta.
@@ -1413,7 +1594,7 @@ void MasterFirmwareRuntime::pushPanelEvent(uint8_t status, uint8_t data1,
     const auto consumer = readPointer(readPointerAddress);
     if (producer < ringBegin || producer >= ringEnd
         || consumer < ringBegin || consumer >= ringEnd)
-        return;
+        return false;
 
     const auto advance = [](uint32_t pointer) {
         ++pointer;
@@ -1424,20 +1605,33 @@ void MasterFirmwareRuntime::pushPanelEvent(uint8_t status, uint8_t data1,
     {
         end = advance(end);
         if (end == consumer)
-            return;
+            return false;
     }
-    for (const auto value : { status, data1, data2 })
+    for (const auto value : event)
     {
         ram[producer] = value;
         producer = advance(producer);
     }
     writePointer(writePointerAddress, producer);
+    return true;
 }
 
 int MasterFirmwareRuntime::discardPendingPanelButtonEvents(int buttonId) noexcept
 {
     if (sharedMemory == nullptr || buttonId < 0 || buttonId >= 128)
         return 0;
+
+    int queuedRemoved = 0;
+    size_t retainedCount = 0;
+    for (size_t i = 0; i < pendingPanelEventCount; ++i)
+    {
+        const auto& event = pendingPanelEvents[i];
+        if (event[0] == 0x80u && event[1] == static_cast<uint8_t>(buttonId))
+            ++queuedRemoved;
+        else
+            pendingPanelEvents[retainedCount++] = event;
+    }
+    pendingPanelEventCount = retainedCount;
 
     constexpr uint32_t readPointerAddress = 0x551f0u;
     constexpr uint32_t writePointerAddress = 0x551f4u;
@@ -1465,11 +1659,11 @@ int MasterFirmwareRuntime::discardPendingPanelButtonEvents(int buttonId) noexcep
     const auto producer = readPointer(writePointerAddress);
     if (consumer < ringBegin || consumer >= ringEnd
         || producer < ringBegin || producer >= ringEnd)
-        return 0;
+        return queuedRemoved;
 
     std::array<uint8_t, ringEnd - ringBegin> retained{};
     auto retainedBytes = size_t{};
-    auto removed = 0;
+    auto removed = queuedRemoved;
     auto cursor = consumer;
     while (cursor != producer)
     {
@@ -1477,11 +1671,11 @@ int MasterFirmwareRuntime::discardPendingPanelButtonEvents(int buttonId) noexcep
         for (auto& byte : event)
         {
             if (cursor == producer)
-                return 0; // The controller ring must contain complete records.
+                return queuedRemoved; // The controller ring must contain complete records.
             byte = ram[cursor];
             cursor = advance(cursor);
         }
-        if ((event[0] & 0x80u) != 0u
+        if (event[0] == 0x80u
             && event[1] == static_cast<uint8_t>(buttonId))
         {
             ++removed;
@@ -1504,6 +1698,9 @@ int MasterFirmwareRuntime::discardPendingPanelButtonEvents(int buttonId) noexcep
 bool MasterFirmwareRuntime::panelEventPending(uint8_t status, uint8_t data1,
                                                uint8_t data2) const noexcept
 {
+    for (size_t i = 0; i < pendingPanelEventCount; ++i)
+        if (pendingPanelEvents[i] == std::array<uint8_t, 3> { status, data1, data2 })
+            return true;
     if (sharedMemory == nullptr)
         return false;
     constexpr uint32_t readPointerAddress = 0x551f0u;
@@ -1549,6 +1746,18 @@ bool MasterFirmwareRuntime::releasePanelEventLatch(int buttonId) noexcept
 {
     if (sharedMemory == nullptr || buttonId < 0 || buttonId >= 87)
         return false;
+
+    // OK/CANCEL share a chord latch and execute on release ($28416-$28474).
+    // A missed scanner release can leave the panic state at $FF indefinitely.
+    // Once both physical contacts are up, clear only that stale held state
+    // before a new explicit response transaction.
+    if ((buttonId == 70 || buttonId == 71)
+        && !panelButtonRequestedDown(70) && !panelButtonRequestedDown(71)
+        && !panelButtonPressed(70) && !panelButtonPressed(71))
+    {
+        sharedMemory->mainRam[0x58feau] = 0;
+        return true;
+    }
 
     // OS 1.700's event dispatcher maps panel serials through $2850E and keeps
     // the active auto-repeat action at $58FE4. Mirror its release branch at

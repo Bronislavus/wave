@@ -23,16 +23,25 @@ public:
         bool validLayout = false;
         int validSounds = 0;
         int validPerformances = 0;
+        int emptySounds = 0;
+        int emptyPerformances = 0;
+        int invalidSounds = 0;
+        int invalidPerformances = 0;
         juce::String sha256;
         juce::String detail;
     };
 
     Report load(const void* bytes, size_t size);
     Report load(const juce::MemoryBlock& data) { return load(data.getData(), data.getSize()); }
+    // Host snapshots contain native SRAM, including uninitialised/empty slots.
+    // Preserve those bytes without applying disk-import record validation.
+    Report loadStateSnapshot(const juce::MemoryBlock& data);
 
     [[nodiscard]] bool isLoaded() const noexcept { return report.validLayout; }
     [[nodiscard]] const Report& getReport() const noexcept { return report; }
     [[nodiscard]] std::span<const uint8_t, soundSize> sound(int bank, int program) const noexcept;
+    [[nodiscard]] std::span<const uint8_t> performanceBank() const noexcept { return performances; }
+    [[nodiscard]] std::span<const uint8_t> soundBank() const noexcept { return sounds; }
     [[nodiscard]] std::span<const uint8_t, performanceSize> performance(
         int bank, int program) const noexcept;
     [[nodiscard]] std::string soundName(int bank, int program) const;
@@ -44,6 +53,9 @@ public:
     {
         return loadedImage;
     }
+    [[nodiscard]] juce::MemoryBlock imageWithStoredBanks(
+        std::span<const uint8_t> storedSounds,
+        std::span<const uint8_t> storedPerformances) const;
 
 private:
     static constexpr size_t soundBankOffset = 0x12e7c;

@@ -2,6 +2,7 @@
 #include "PanelWiring.h"
 
 #include <array>
+#include <cmath>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -10,6 +11,16 @@
 
 namespace
 {
+std::unique_ptr<WaveEmulationAudioProcessor> makeFactoryProcessor(const juce::File& preference = {})
+{
+    // Layout tests must not inherit the developer's remembered panel skin or
+    // firmware folder. Explicit test preferences still exercise persistence.
+    juce::TemporaryFile isolatedPreference(".txt");
+    return std::make_unique<WaveEmulationAudioProcessor>(
+        preference == juce::File{} ? isolatedPreference.getFile() : preference,
+        WaveEmulationAudioProcessor::InitialBank::embeddedFactory);
+}
+
 void require(bool condition, const char* message)
 {
     if (!condition)
@@ -99,9 +110,53 @@ void dragEditorControl(WaveEmulationAudioProcessorEditor& editor,
     editor.mouseUp(up);
 }
 
+void testWindowShortcutsPreservePanelLayout()
+{
+    auto processor = makeFactoryProcessor();
+    WaveEmulationAudioProcessorEditor editor(*processor);
+    editor.setVisible(true);
+    auto* lcd = static_cast<juce::Component*>(nullptr);
+    for (int index = 0; index < editor.getNumChildComponents(); ++index)
+    {
+        auto* child = editor.getChildComponent(index);
+        if (dynamic_cast<wave::ui::WaveLcdComponent*>(child) != nullptr)
+            lcd = child;
+    }
+    require(lcd != nullptr, "Could not find the firmware LCD in the editor");
+    const auto fullLcdBounds = lcd->getBounds();
+    const auto pressCommand = [&](int keyCode) {
+        return editor.keyPressed(juce::KeyPress(
+            keyCode, juce::ModifierKeys { juce::ModifierKeys::commandModifier }, 0));
+    };
+
+    require(editor.getWidth() == 2338 && editor.getHeight() == 1042,
+            "Editor did not open at its default scale");
+    require(pressCommand('k') && editor.getWidth() == 2338
+                && editor.getHeight() == 619 && lcd->getBounds() == fullLcdBounds,
+            "Hide Keyboard distorted or moved the upper panel");
+    require(std::abs(editor.getConstrainer()->getFixedAspectRatio()
+                         - 2338.0 / 619.0) < 0.001,
+            "Hidden keyboard kept the full-height resize aspect ratio");
+    require(pressCommand('+') && editor.getWidth() == 2572
+                && editor.getHeight() == 681,
+            "Zoom In did not resize the cropped panel");
+    require(pressCommand('-') && editor.getWidth() == 2338
+                && editor.getHeight() == 619,
+            "Zoom Out did not restore the cropped panel size");
+    require(pressCommand('k') && editor.getWidth() == 2338
+                && editor.getHeight() == 1042
+                && lcd->getBounds() == fullLcdBounds,
+            "Show Keyboard did not restore the full editor");
+    require(pressCommand('-') && editor.getWidth() == 2104,
+            "Zoom Out did not shrink the full editor");
+    require(pressCommand('0') && editor.getWidth() == 2338
+                && editor.getHeight() == 1042,
+            "Actual Size did not restore the default editor size");
+}
+
 void testLowerPerformanceWheelsFollowHardwareRules()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     WaveEmulationAudioProcessorEditor editor(*processor);
     editor.setVisible(true);
@@ -131,7 +186,7 @@ void testLowerPerformanceWheelsFollowHardwareRules()
 
 void testRepeatedInstrumentEditLayerClicks()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(41); // A042: three active Instruments.
     juce::AudioBuffer<float> audio(2, 512);
@@ -211,7 +266,7 @@ void testRepeatedInstrumentEditLayerClicks()
 
 void testLayerProcessingPromptAcceptsCancel()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 640);
@@ -282,7 +337,7 @@ void testLayerProcessingPromptAcceptsCancel()
 
 void testFirmwareWavetableStepReachesAudioParameter()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 64);
@@ -317,7 +372,7 @@ void testFirmwareWavetableStepReachesAudioParameter()
 
 void testInstrumentEditPageOneFadersUpdatePerformance()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 640);
@@ -355,7 +410,7 @@ void testInstrumentEditPageOneFadersUpdatePerformance()
     };
     constexpr auto channels = wave::panel::performanceFaderAdcChannels;
     constexpr std::array<uint32_t, 8> offsets {
-        4u, 5u, 7u, 8u, 9u, 10u, 2u, 3u
+        4u, 5u, 7u, 12u, 9u, 10u, 2u, 3u
     };
     constexpr std::array<float, 8> positions {
         0.50f, 0.25f, 0.25f, 0.75f,
@@ -365,7 +420,7 @@ void testInstrumentEditPageOneFadersUpdatePerformance()
         64, 32, 32, 2, 32, 95, 12, 1
     };
 
-    processor->setPanelFader(3, channels[3], 0.0f, false); // Main output.
+    processor->setPanelFader(3, channels[3], 1.0f / 3.0f, false); // Main output.
     processor->setPanelFader(7, channels[7], 1.0f, false); // Keys + MIDI.
     processor->setPanelFader(0, channels[0], 0.0f, false);
     processBlocks(*processor, audio, 32);
@@ -375,6 +430,10 @@ void testInstrumentEditPageOneFadersUpdatePerformance()
 
     for (size_t fader = 0; fader < channels.size(); ++fader)
     {
+        std::array<uint8_t, 32> before {};
+        for (size_t offset = 0; offset < before.size(); ++offset)
+            before[offset] = processor->getMasterFirmwareRuntime().sharedProgramByte(
+                instrumentBase() + static_cast<uint32_t>(offset));
         processor->setPanelFader(static_cast<int>(fader), channels[fader],
                                  positions[fader], false);
         processBlocks(*processor, audio, 32);
@@ -387,10 +446,15 @@ void testInstrumentEditPageOneFadersUpdatePerformance()
                 + std::to_string(fader) + ", expected "
                 + std::to_string(expected[fader]) + ", observed "
                 + std::to_string(stored));
+        for (size_t offset = 0; offset < before.size(); ++offset)
+            if (offset != offsets[fader])
+                require(processor->getMasterFirmwareRuntime().sharedProgramByte(
+                            instrumentBase() + static_cast<uint32_t>(offset)) == before[offset],
+                        "Page 1 fader changed another Instrument field");
     }
 
     // Volume must reach the live layer, not just its LCD/record value.
-    processor->setPanelFader(3, channels[3], 0.0f, false); // Main output.
+    processor->setPanelFader(3, channels[3], 1.0f / 3.0f, false); // Main output.
     processor->setPanelFader(7, channels[7], 1.0f, false); // Keys + MIDI.
     processBlocks(*processor, audio, 32);
     const auto audible = processor->probeCurrentLayerVoice(
@@ -404,7 +468,7 @@ void testInstrumentEditPageOneFadersUpdatePerformance()
 
 void testInstrumentPageOneFaderDoesNotLeakIntoOtherPages()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 640);
@@ -448,7 +512,8 @@ void testInstrumentPageOneFaderDoesNotLeakIntoOtherPages()
         wave::panel::performanceFaderAdcChannels[audioOutFader], 0.92f, false);
     processBlocks(*processor, audio, 1200);
 
-    constexpr auto audioOutRecordOffset = size_t { 8 };
+    // Audio Out is Instrument part byte +0xC (firmware table 0x14BCA).
+    constexpr auto audioOutRecordOffset = size_t { 12 };
     require((processor->getMasterFirmwareRuntime().sharedProgramByte(
                  base + static_cast<uint32_t>(audioOutRecordOffset))
              & 0x7fu)
@@ -468,7 +533,7 @@ void testInstrumentPageOneFaderDoesNotLeakIntoOtherPages()
 
 void testInstrumentEditPageTwoVolumeReachesAudioEngine()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 640);
@@ -484,6 +549,16 @@ void testInstrumentEditPageTwoVolumeReachesAudioEngine()
     require(processor->getInstrumentEditPage() == 1,
             "Instrument Edit did not reach Page 2 for its audio test");
 
+    // Firmware remembers Page 2 across mode changes. The host must not reset
+    // its fader destinations to Page 1 when Instrument Edit is reopened.
+    clickPanelControl(editor, *processor, audio, 1402.5f, 553.0f);
+    clickPanelControl(editor, *processor, audio, 1402.5f, 494.0f);
+    processBlocks(*processor, audio, 320);
+    require(processor->getMasterFirmwareRuntime().localByte(0x56ee9u) == 1u,
+            "Firmware did not restore Instrument Edit Page 2");
+    require(processor->getInstrumentEditPage() == 1,
+            "Reopening Instrument Edit routed Page 2 faders to Page 1");
+
     const auto instrument = processor->getSelectedPerformanceInstrument();
     const auto performanceOffset = processor->getMasterFirmwareRuntime()
                                        .currentPerformanceRecordOffset();
@@ -497,6 +572,137 @@ void testInstrumentEditPageTwoVolumeReachesAudioEngine()
         return *currentOffset + 64u
                + static_cast<uint32_t>(instrument) * 32u;
     };
+    // Compare every reachable ADC value with the actual firmware-rendered
+    // TuneTable word. The native display has 13 uneven bins, including a
+    // transition between two ADC values that share one seven-bit position.
+    const auto tuningScreen = [&] {
+        const auto& runtime = processor->getMasterFirmwareRuntime();
+        const auto video = runtime.lcdVideoSnapshot();
+        wave::ui::LcdFramebuffer framebuffer;
+        framebuffer.loadHardwareVideoRam(video.data(), video.size(),
+                                         runtime.lcdDisplayPage());
+        std::array<uint8_t, 600> word {};
+        for (int y = 54; y < 64; ++y)
+            for (int x = 240; x < 300; ++x)
+                word[static_cast<size_t>((y - 54) * 60 + x - 240)]
+                    = static_cast<uint8_t>(framebuffer.pixel(x, y));
+        return word;
+    };
+    const auto setTuningFader = [&](int physical) {
+        processor->setPanelFader(
+            4, wave::panel::performanceFaderAdcChannels[4],
+            static_cast<float>(physical) / 127.0f, false);
+        processBlocks(*processor, audio, 64);
+        return tuningScreen();
+    };
+    std::array<std::array<uint8_t, 600>, 13> tuningWords {};
+    for (int selector = 0; selector < 13; ++selector)
+    {
+        const auto first = (selector * 128 + 12) / 13;
+        const auto last = ((selector + 1) * 128 - 1) / 13;
+        tuningWords[static_cast<size_t>(selector)]
+            = setTuningFader((first + last) / 2);
+        if (selector > 0)
+            require(tuningWords[static_cast<size_t>(selector)]
+                        != tuningWords[static_cast<size_t>(selector - 1)],
+                    "Two TuneTable selectors rendered the same LCD word");
+    }
+    juce::MidiBuffer heldNote;
+    heldNote.addEvent(juce::MidiMessage::noteOn(1, 60, 0.9f), 0);
+    audio.clear();
+    processor->processBlock(audio, heldNote);
+    processBlocks(*processor, audio, 32);
+    require(processor->getActiveVoiceCount() > 0,
+            "TuneTable sweep did not hold a sounding note");
+    std::array<uint8_t, 32> recordBefore {};
+    for (size_t offset = 0; offset < recordBefore.size(); ++offset)
+        recordBefore[offset] = processor->getMasterFirmwareRuntime()
+                                   .sharedProgramByte(instrumentBase()
+                                                      + static_cast<uint32_t>(offset));
+    const auto soundRecordOffset = processor->getMasterFirmwareRuntime()
+                                       .performanceInstrumentSoundRecordOffset(instrument);
+    require(soundRecordOffset.has_value(),
+            "TuneTable sweep could not locate the active Sound record");
+    std::array<uint8_t, wave::presets::WaveFactorySet::soundSize> soundBefore {};
+    for (size_t offset = 0; offset < soundBefore.size(); ++offset)
+        soundBefore[offset] = processor->getMasterFirmwareRuntime()
+                                  .sharedProgramByte(*soundRecordOffset
+                                                     + static_cast<uint32_t>(offset));
+    const auto snapshotBefore = processor->getCurrentPerformanceSnapshot();
+    for (int adc = 0; adc < 256; ++adc)
+    {
+        processor->setPanelFader(
+            4, wave::panel::performanceFaderAdcChannels[4],
+            static_cast<float>(adc) / 255.0f, false);
+        processBlocks(*processor, audio, 64);
+        const auto screen = tuningScreen();
+        const auto stored = static_cast<int>(
+            processor->getMasterFirmwareRuntime()
+                .sharedProgramByte(instrumentBase() + 22u)
+            & 0x7fu);
+        const auto audible = processor->getCurrentPerformanceSnapshot()
+                                 .layers[static_cast<size_t>(instrument)]
+                                 .tuningTable;
+        auto displayed = -1;
+        for (int candidate = 0; candidate < 13; ++candidate)
+            if (screen == tuningWords[static_cast<size_t>(candidate)])
+                displayed = candidate;
+        if (displayed < 0 || stored != displayed || audible != displayed)
+            throw std::runtime_error(
+                "TuneTable LCD and audio disagree at ADC "
+                + std::to_string(adc) + ": LCD "
+                + std::to_string(displayed) + ", record "
+                + std::to_string(stored) + ", engine "
+                + std::to_string(audible));
+        for (size_t offset = 0; offset < recordBefore.size(); ++offset)
+            if (offset != 22u
+                && processor->getMasterFirmwareRuntime().sharedProgramByte(
+                       instrumentBase() + static_cast<uint32_t>(offset))
+                       != recordBefore[offset])
+                throw std::runtime_error(
+                    "Held-note TuneTable edit changed Instrument record byte "
+                    + std::to_string(offset) + " at ADC "
+                    + std::to_string(adc));
+        for (size_t offset = 0; offset < soundBefore.size(); ++offset)
+            if (processor->getMasterFirmwareRuntime().sharedProgramByte(
+                    *soundRecordOffset + static_cast<uint32_t>(offset))
+                != soundBefore[offset])
+                throw std::runtime_error(
+                    "Held-note TuneTable edit changed Sound record byte "
+                    + std::to_string(offset) + " at ADC "
+                    + std::to_string(adc));
+        const auto current = processor->getCurrentPerformanceSnapshot();
+        const auto& currentLayer = current.layers[static_cast<size_t>(instrument)];
+        const auto& previousLayer
+            = snapshotBefore.layers[static_cast<size_t>(instrument)];
+        if (currentLayer.transposeSemitones != previousLayer.transposeSemitones
+            || currentLayer.sound.oscillatorOctaves
+                   != previousLayer.sound.oscillatorOctaves)
+            throw std::runtime_error(
+                "Held-note TuneTable edit changed transpose or oscillator octave at ADC "
+                + std::to_string(adc));
+    }
+    // ADC 55 is in the displayed HMT band, but the old seven-bit mapping
+    // selected Linear- in the engine. A second external MIDI key exposes the
+    // error as a large downward pitch jump while the first key stays held.
+    processor->setPanelFader(
+        4, wave::panel::performanceFaderAdcChannels[4], 55.0f / 255.0f, false);
+    processBlocks(*processor, audio, 64);
+    require(processor->getCurrentPerformanceSnapshot()
+                .layers[static_cast<size_t>(instrument)].tuningTable == 2,
+            "Displayed HMT band selected another audible tuning");
+    juce::MidiBuffer secondHeldNote;
+    secondHeldNote.addEvent(juce::MidiMessage::noteOn(1, 72, 0.9f), 0);
+    processor->processBlock(audio, secondHeldNote);
+    processBlocks(*processor, audio, 4);
+    auto secondNotePitch = -1.0f;
+    for (const auto& voice : processor->getVoiceStates())
+        if (voice.active && voice.keyDown && voice.triggerNote == 72)
+            secondNotePitch = voice.glidePitch;
+    require(std::abs(secondNotePitch - 72.0f) < 1.0e-4f,
+            "New external MIDI note fell to Linear- pitch while HMT was displayed");
+    processor->allSoundOffFromUi();
+    processBlocks(*processor, audio, 8);
     constexpr auto volumeFader = 0;
     constexpr auto volumeOffset = 4u;
     constexpr std::array<uint32_t, 8> pageTwoOffsets {
@@ -512,6 +718,14 @@ void testInstrumentEditPageTwoVolumeReachesAudioEngine()
 
     for (size_t fader = 0; fader < pageTwoOffsets.size(); ++fader)
     {
+        // Exercise the retained page on every return, not only initial entry.
+        clickPanelControl(editor, *processor, audio, 1402.5f, 553.0f);
+        clickPanelControl(editor, *processor, audio, 1402.5f, 494.0f);
+        processBlocks(*processor, audio, 64);
+        std::array<uint8_t, 32> before {};
+        for (size_t offset = 0; offset < before.size(); ++offset)
+            before[offset] = processor->getMasterFirmwareRuntime().sharedProgramByte(
+                instrumentBase() + static_cast<uint32_t>(offset));
         processor->setPanelFader(
             static_cast<int>(fader),
             wave::panel::performanceFaderAdcChannels[fader],
@@ -526,7 +740,16 @@ void testInstrumentEditPageTwoVolumeReachesAudioEngine()
                 "Instrument Edit Page 2 fader did not commit its native field: fader "
                 + std::to_string(fader) + ", expected "
                 + std::to_string(pageTwoExpected[fader]) + ", observed "
-                + std::to_string(stored));
+                + std::to_string(stored) + ", host page "
+                + std::to_string(processor->getInstrumentEditPage())
+                + ", firmware page "
+                + std::to_string(processor->getMasterFirmwareRuntime()
+                                     .currentInstrumentEditPage().value_or(-1)));
+        for (size_t offset = 0; offset < before.size(); ++offset)
+            if (offset != pageTwoOffsets[fader])
+                require(processor->getMasterFirmwareRuntime().sharedProgramByte(
+                            instrumentBase() + static_cast<uint32_t>(offset)) == before[offset],
+                        "Page 2 fader changed another Instrument field after mode return");
     }
 
     const auto decodedPageTwo = processor->getCurrentPerformanceSnapshot();
@@ -569,7 +792,7 @@ void testInstrumentEditPageTwoVolumeReachesAudioEngine()
 
 void testWaveEditSoftKeysRelease()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 96);
@@ -652,7 +875,7 @@ void testWaveEditSoftKeysRelease()
 
 void testLowerGlideOnOffUsesFirmwareSerial()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 96);
@@ -673,7 +896,7 @@ void testLowerGlideOnOffUsesFirmwareSerial()
 
 void testEveryLowerControllerButtonReachesItsSerialInput()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 96);
@@ -684,15 +907,22 @@ void testEveryLowerControllerButtonReachesItsSerialInput()
     // These positions are the centres in the complete Figma SVG. The editor
     // helper accepts upper-panel-local X, hence the common artwork offset.
     constexpr auto offset = 66.0f;
-    clickPanelControl(editor, *processor, audio, 110.0f - offset, 766.5f, 16);
-    processBlocks(*processor, audio, 48);
-    require(processor->getPanelLed(16),
-            "The visible lower Button 1 did not reach firmware serial 3");
-
-    clickPanelControl(editor, *processor, audio, 170.0f - offset, 766.5f, 16);
-    processBlocks(*processor, audio, 48);
-    require(processor->getPanelLed(35),
-            "The visible lower Button 2 did not reach firmware serial 4");
+    const auto& firmware = processor->getMasterFirmwareRuntime();
+    const auto performance = firmware.currentPerformanceRecordOffset();
+    require(performance.has_value(), "Lower button fixture has no live Performance");
+    for (const auto [x, led, modeOffset] : std::array<std::tuple<float, int, uint32_t>, 2> {
+             std::tuple<float, int, uint32_t> { 110.0f, 16, 6u }, { 170.0f, 35, 7u } })
+    {
+        const auto toggle = firmware.sharedProgramByte(*performance + modeOffset) != 0u;
+        clickPanelControl(editor, *processor, audio, x - offset, 766.5f, 16, [&] {
+            processBlocks(*processor, audio, 48);
+            require(processor->getPanelLed(led),
+                    "A visible lower Button press did not reach its firmware controller");
+        });
+        processBlocks(*processor, audio, 48);
+        require(processor->getPanelLed(led) == toggle,
+                "A visible lower Button release ignored the Performance mode");
+    }
 
     const auto beforeGlidePage
         = processor->getMasterFirmwareRuntime().lcdVideoSnapshot();
@@ -723,11 +953,26 @@ void testEveryLowerControllerButtonReachesItsSerialInput()
                 && !processor->getPanelLed(58)
                 && !processor->getPanelLed(27),
             "The visible lower Octave Down did not reach firmware serial 73");
+
+    editor.useCompactPanelSkin();
+    require(editor.tooltipAt({ 639.5f, 707.5f }) == "Octave Down"
+                && editor.tooltipAt({ 714.5f, 707.5f }) == "Octave Up",
+            "Compact octave tooltips do not match the revised SVG");
+    clickPanelControl(editor, *processor, audio, 639.5f - offset, 707.5f, 16);
+    processBlocks(*processor, audio, 48);
+    require(processor->getKeyboardOctaveShift() == -1
+                && processor->getPanelLed(27) && !processor->getPanelLed(58),
+            "Compact left Octave Down did not lower the keyboard octave");
+    clickPanelControl(editor, *processor, audio, 714.5f - offset, 707.5f, 16);
+    processBlocks(*processor, audio, 48);
+    require(processor->getKeyboardOctaveShift() == 0
+                && !processor->getPanelLed(27) && !processor->getPanelLed(58),
+            "Compact right Octave Up did not restore the keyboard octave");
 }
 
 void testWaveEnvelopeSelectorRemainsStable()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 96);
@@ -763,7 +1008,7 @@ void testWaveEnvelopeSelectorRemainsStable()
 
 void testPerformanceStepButtonsDoNotRepeatAfterRelease()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(40);
     juce::AudioBuffer<float> audio(2, 512);
@@ -815,7 +1060,7 @@ void testPerformanceStepButtonsDoNotRepeatAfterRelease()
 
 void testColdStartPerformanceStepDoesNotRepeat()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     WaveEmulationAudioProcessorEditor editor(*processor);
@@ -848,7 +1093,7 @@ void testColdStartPerformanceStepDoesNotRepeat()
 
 void testRestoredEditModeCannotMisrouteFirstPerformanceStep()
 {
-    auto saved = std::make_unique<WaveEmulationAudioProcessor>();
+    auto saved = makeFactoryProcessor();
     saved->prepareToPlay(48000.0, 512);
     saved->setCurrentProgram(40);
     juce::AudioBuffer<float> audio(2, 512);
@@ -865,7 +1110,7 @@ void testRestoredEditModeCannotMisrouteFirstPerformanceStep()
     saved->getStateInformation(state);
     saved.reset();
 
-    auto restored = std::make_unique<WaveEmulationAudioProcessor>();
+    auto restored = makeFactoryProcessor();
     restored->setStateInformation(state.getData(),
                                   static_cast<int>(state.getSize()));
     restored->prepareToPlay(48000.0, 512);
@@ -884,7 +1129,7 @@ void testRestoredEditModeCannotMisrouteFirstPerformanceStep()
 
 void testPerformanceStepCancelsAnOutgoingEditStep()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(40);
     juce::AudioBuffer<float> audio(2, 512);
@@ -944,7 +1189,7 @@ void testPerformanceStepCancelsAnOutgoingEditStep()
 
 void testModeButtonsChangePageOnFirstClick()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 160);
@@ -997,7 +1242,7 @@ void testModeButtonsChangePageOnFirstClick()
 
 void testPageButtonsChangePageOnFirstClick()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 160);
@@ -1053,7 +1298,7 @@ void testPageButtonsChangePageOnFirstClick()
 
 void testModifierEditButtonsOpenFirmwarePages()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(0);
     juce::AudioBuffer<float> audio(2, 512);
@@ -1079,8 +1324,9 @@ void testModifierEditButtonsOpenFirmwarePages()
         processBlocks(*processor, audio, 240);
         require(processor->getPanelLed(ledCodes[index]),
                 "A Modifier Edit button did not latch its LED");
-        require(processor->getMasterFirmwareRuntime().lcdVideoSnapshot() != before,
-                "A Modifier Edit button did not open its firmware LCD page");
+        if (processor->getMasterFirmwareRuntime().lcdVideoSnapshot() == before)
+            throw std::runtime_error("Modifier Edit button " + std::to_string(index + 1)
+                                     + " did not open its firmware LCD page");
         const auto callback
             = (static_cast<uint32_t>(processor->getMasterFirmwareRuntime().localByte(
                    0x56bb0u))
@@ -1105,13 +1351,103 @@ void testModifierEditButtonsOpenFirmwarePages()
     }
 }
 
+void testNumericKeypadUi()
+{
+    for (int skin = 0; skin < 3; ++skin)
+    {
+        juce::TemporaryFile preference(".txt");
+        auto processor = std::make_unique<WaveEmulationAudioProcessor>(preference.getFile());
+        processor->prepareToPlay(48000.0, 512);
+        juce::AudioBuffer<float> audio(2, 512);
+        processBlocks(*processor, audio, 160);
+        WaveEmulationAudioProcessorEditor editor(*processor);
+        editor.setVisible(true);
+        const auto compact = skin == 1;
+        if (compact)
+            editor.useCompactPanelSkin();
+        else if (skin == 2)
+            require(editor.loadPanelSkin(juce::File::getCurrentWorkingDirectory()
+                        .getChildFile("media/WaldorfWaveUI_NOLOGO.svg")).wasOk(),
+                    "Could not load the alternative keypad test skin");
+        const auto clickDigit = [&](float originalX, float originalY, float compactX, float compactY) {
+            clickPanelControl(editor, *processor, audio,
+                              compact ? compactX - 66.0f : originalX,
+                              compact ? compactY : originalY, 0);
+            processBlocks(*processor, audio, 64);
+        };
+        const auto before = processor->getMasterFirmwareRuntime().lcdVideoSnapshot();
+        clickDigit(1641.0f, 553.0f, 676.5f, 439.5f); // 0.
+        require(processor->getMasterFirmwareRuntime().lcdVideoSnapshot() != before,
+                "First keypad digit did not open number entry on the LCD");
+        clickDigit(1641.0f, 513.0f, 676.5f, 401.5f); // 2: A002.
+        require(processor->getMasterFirmwareRuntime().currentPerformanceId() == 1,
+                "Keypad did not select A002");
+        // Exercise every digit through its painted hit area.
+        for (const auto& digit : std::array<std::array<float, 4>, 6> {{
+                 {1680.0f,513.0f,714.5f,401.5f}, // 3.
+                 {1602.0f,475.0f,638.5f,363.5f}, // 4: A034.
+                 {1641.0f,475.0f,676.5f,363.5f}, // 5.
+                 {1680.0f,475.0f,714.5f,363.5f}, // 6: A056.
+                 {1602.0f,435.0f,638.5f,325.5f}, // 7.
+                 {1641.0f,435.0f,676.5f,325.5f}  // 8: A078.
+             }})
+            clickDigit(digit[0], digit[1], digit[2], digit[3]);
+        require(processor->getMasterFirmwareRuntime().currentPerformanceId() == 77,
+                "Keypad digit sequence did not select A078");
+        clickDigit(1641.0f, 553.0f, 676.5f, 439.5f); // 0.
+        clickDigit(1641.0f, 513.0f, 676.5f, 401.5f); // 2: restore A002.
+        clickDigit(1602.0f, 553.0f, 638.5f, 439.5f); // 1__: hundreds prefix.
+        clickDigit(1641.0f, 513.0f, 676.5f, 401.5f); // 2.
+        clickDigit(1680.0f, 435.0f, 714.5f, 325.5f); // 9: A129 is invalid.
+        require(processor->getMasterFirmwareRuntime().currentPerformanceId() == 1,
+                "Invalid keypad number changed Performance");
+        clickDigit(1602.0f, 553.0f, 638.5f, 439.5f); // 1__.
+        clickDigit(1641.0f, 513.0f, 676.5f, 401.5f); // 2.
+        clickDigit(1641.0f, 435.0f, 676.5f, 325.5f); // 8: A128.
+        require(processor->getMasterFirmwareRuntime().currentPerformanceId() == 127,
+                "Keypad hundreds prefix did not select A128");
+        clickDigit(1543.0f, 553.0f, 638.5f, 583.5f); // Bank B.
+        clickDigit(1641.0f, 553.0f, 676.5f, 439.5f); // 0.
+        clickDigit(1641.0f, 513.0f, 676.5f, 401.5f); // 2: B002.
+        require(processor->getMasterFirmwareRuntime().currentPerformanceId() == 129,
+                "Keypad did not select a Performance in Bank B");
+    }
+}
+
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI initialiseGui;
     try
     {
+        if (argc == 2 && std::string_view(argv[1]) == "--keypad")
+        {
+            testNumericKeypadUi();
+            std::cout << "Numeric keypad UI checks passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--keyboard-buttons")
+        {
+            testEveryLowerControllerButtonReachesItsSerialInput();
+            std::cout << "Lower keyboard button UI checks passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--instrument-faders")
+        {
+            testInstrumentEditPageOneFadersUpdatePerformance();
+            testInstrumentPageOneFaderDoesNotLeakIntoOtherPages();
+            testInstrumentEditPageTwoVolumeReachesAudioEngine();
+            std::cout << "Instrument fader checks passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--modifier-edit")
+        {
+            testModifierEditButtonsOpenFirmwarePages();
+            std::cout << "Modifier Edit checks passed\n";
+            return 0;
+        }
+        testWindowShortcutsPreservePanelLayout();
         testLowerPerformanceWheelsFollowHardwareRules();
         testLayerProcessingPromptAcceptsCancel();
         testInstrumentEditPageOneFadersUpdatePerformance();

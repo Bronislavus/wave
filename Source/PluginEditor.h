@@ -10,11 +10,18 @@
 
 class WaveEmulationAudioProcessorEditor final : public juce::AudioProcessorEditor,
                                                 private juce::Timer,
-                                                private juce::MenuBarModel
+                                                private juce::MenuBarModel,
+                                                public juce::TooltipClient
 {
 public:
     explicit WaveEmulationAudioProcessorEditor(WaveEmulationAudioProcessor&);
     ~WaveEmulationAudioProcessorEditor() override;
+
+    juce::String getTooltip() override;
+    [[nodiscard]] juce::String tooltipAt(juce::Point<float> editorPoint) const;
+    juce::Result loadPanelSkin(const juce::File& file, bool remember = true);
+    void useDefaultPanelSkin();
+    void useCompactPanelSkin();
 
     void paint(juce::Graphics&) override;
     void resized() override;
@@ -25,13 +32,6 @@ public:
     bool keyPressed(const juce::KeyPress&) override;
     bool keyStateChanged(bool isKeyDown) override;
     void focusLost(FocusChangeType) override;
-
-    enum class PanelLayout
-    {
-        full = 0,
-        noKeyboard = 1,
-        panelOnly = 2
-    };
 
 private:
     class WaveLookAndFeel;
@@ -60,6 +60,7 @@ private:
         int faderIndex = -1;
         float faderTrackTop = 0.0f;
         float faderTrackBottom = 0.0f;
+        float artworkScale = 1.0f;
     };
 
     struct PanelLed
@@ -67,6 +68,7 @@ private:
         juce::Point<float> centre;
         int redSerialCode = -1;
         int greenSerialCode = -1;
+        float size = 6.0f;
     };
 
     ParameterKnob& addKnob(const juce::String& parameterId, const juce::String& displayName,
@@ -76,6 +78,10 @@ private:
     void updateLfoKnobBindings();
     void updateWaveEnvelopeKnobBindings();
     void initialisePanelRegions(const juce::XmlElement& svg);
+    void initialiseCompactPanelRegions(const juce::XmlElement& svg);
+    void applyPanelLayout(bool compact, float scale);
+    [[nodiscard]] float panelDesignWidth() const noexcept;
+    [[nodiscard]] float panelDesignHeight() const noexcept;
     void synchroniseFaderValues() noexcept;
     void rebuildPanelImage();
     bool handlePerformanceControl(juce::Point<float> designPoint);
@@ -88,35 +94,36 @@ private:
     void releaseComputerKeyboardNotes();
     void releaseComputerKeyboardShift();
     void timerCallback() override;
-    [[nodiscard]] float visibleDesignHeight() const noexcept;
-    [[nodiscard]] float currentScale() const noexcept;
-    [[nodiscard]] float fitToScreenScale() const;
-    [[nodiscard]] juce::Rectangle<float> fullArtworkBounds(float pixelScale) const noexcept;
-    void applyLayout(PanelLayout layout, float scale);
-    void stepZoom(int direction);
     juce::StringArray getMenuBarNames() override;
     juce::PopupMenu getMenuForIndex(int topLevelMenuIndex,
                                     const juce::String& menuName) override;
     void menuItemSelected(int menuItemId, int topLevelMenuIndex) override;
     void showSystemMenu();
     void showFirmwareFolderChooser();
+    void showPanelSkinChooser();
     void showDiskImageChooser();
     void showCreateBlankDiskChooser();
     void showCreateDiskFromSetChooser();
+    void showCreateDiskFromWavetableChooser();
     void showDiskDestinationChooser(const juce::File& waveSetup);
     void showSaveDiskAsChooser();
     void showDiskError(const juce::String& title, const juce::Result& result);
+    void setWindowScale(float scale);
+    void setKeyboardVisible(bool visible);
+    [[nodiscard]] float activeDesignHeight() const noexcept;
+    [[nodiscard]] float fitToScreenScale() const;
+    void restoreWindowPreferences();
+    void saveWindowPreferences();
 
     WaveEmulationAudioProcessor& ownerProcessor;
-    std::unique_ptr<juce::PropertiesFile> uiSettings;
-    PanelLayout panelLayout = PanelLayout::full;
-    bool layoutInitialised = false;
-    juce::Colour keybedCoverColour { 0xff2b2b3f };
     std::unique_ptr<WaveLookAndFeel> lookAndFeel;
     std::vector<std::unique_ptr<ParameterKnob>> knobs;
     std::unique_ptr<wave::ui::WaveLcdComponent> lcd;
     std::unique_ptr<juce::Drawable> panelArtwork;
     juce::Image panelImage;
+    juce::File panelSkinFile;
+    juce::TooltipWindow tooltipWindow { this, 650 };
+    std::unique_ptr<juce::FileChooser> panelSkinChooser;
     std::unique_ptr<juce::Drawable> sliderArtwork;
     std::unique_ptr<juce::Drawable> knobArtwork;
     std::unique_ptr<juce::Drawable> redKnobArtwork;
@@ -160,6 +167,10 @@ private:
     std::array<float, 3> performanceWheelValues { 0.5f, 0.0f, 0.5f };
     std::array<bool, 13> keyboardNotes{};
     bool computerShiftDown = false;
+    bool keyboardVisible = true;
+    std::unique_ptr<juce::PropertiesFile> windowSettings;
+    bool windowPreferencesRestored = false;
+    bool compactSkin = false;
     bool performanceMode = true;
     int selectedLfo = 0;
     int waveEnvelopePage = 0;

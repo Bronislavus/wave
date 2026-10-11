@@ -7,8 +7,8 @@
 # are stored in this script.
 #
 # Common overrides:
-#   VERSION=0.1.6            (must match the built bundles)
-#   RELEASE_LABEL=0.1.6-resizable  (shown in file names and the installer)
+#   VERSION=0.1.13             (must match the built bundles)
+#   RELEASE_LABEL=0.1.13-resizable  (shown in file names and the installer)
 #   BUILD_JOBS=8
 #   SKIP_PLUGIN_BUILD=1
 #   SKIP_WRAP=1
@@ -38,7 +38,7 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if [ -f "$PROJECT_ROOT/Installer/.env.local" ]; then
   source "$PROJECT_ROOT/Installer/.env.local"
 fi
-BUILD_DIR="$PROJECT_ROOT/build"
+BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build}"
 INSTALLER_DIR="$PROJECT_ROOT/Installer"
 WORK_DIR="$INSTALLER_DIR/.release-work"
 STAGING_DIR="$WORK_DIR/staging"
@@ -46,9 +46,9 @@ PACKAGES_DIR="$WORK_DIR/packages"
 RESOURCES_DIR="$WORK_DIR/resources"
 DMG_STAGING_DIR="$WORK_DIR/dmg"
 
-VERSION="${VERSION:-0.1.6}"
-# Label for a derived release; the bundle version itself stays numeric.
-RELEASE_LABEL="${RELEASE_LABEL:-$VERSION}"
+VERSION="${VERSION:-0.1.13}"
+# Label for this derived release; the bundle version itself stays numeric.
+RELEASE_LABEL="${RELEASE_LABEL:-$VERSION-resizable}"
 TEAM_ID="${TEAM_ID:-}"
 BUILD_CONFIG="${BUILD_CONFIG:-Release}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-$BUILD_CONFIG}"
@@ -85,6 +85,13 @@ NOTARIZE_APPLE_ID="${NOTARIZE_APPLE_ID:-${APPLE_ID:-}}"
 NOTARIZE_PASSWORD="${NOTARIZE_PASSWORD:-${APP_SPECIFIC_PASSWORD:-}}"
 NOTARIZE_TEAM_ID="${NOTARIZE_TEAM_ID:-$TEAM_ID}"
 NOTARIZE_DMG="${NOTARIZE_DMG:-1}"
+# An AAX bundle that is not PACE-wrapped will not load in Pro Tools and cannot
+# pass notarization unsigned, so it is left out of the installer by default.
+if is_truthy "${SKIP_WRAP:-}"; then
+  INCLUDE_AAX="${INCLUDE_AAX:-0}"
+else
+  INCLUDE_AAX="${INCLUDE_AAX:-1}"
+fi
 
 FINAL_PKG_NAME="${FINAL_PKG_NAME:-DJW $PRODUCT_NAME Installer $RELEASE_LABEL.pkg}"
 FINAL_DMG_NAME="${FINAL_DMG_NAME:-DJW $PRODUCT_NAME $RELEASE_LABEL.dmg}"
@@ -99,14 +106,16 @@ find_signing_identities() {
   : "${TEAM_ID:?Set TEAM_ID for release signing, or use SKIP_SIGN=1}"
 
   if [ -z "${CODESIGN_IDENTITY:-}" ]; then
+    # Use the SHA-1 fingerprint, not the name: names with non-ASCII letters
+    # (e.g. Polish diacritics) get mangled and are then "not found".
     CODESIGN_IDENTITY="$(security find-identity -v -p codesigning |
       grep "Developer ID Application" | grep "$TEAM_ID" | head -1 |
-      sed -E 's/.*"([^"]+)".*/\1/' || true)"
+      awk '{print $2}' || true)"
   fi
   if [ -z "${INSTALLER_IDENTITY:-}" ]; then
     INSTALLER_IDENTITY="$(security find-identity -v |
       grep "Developer ID Installer" | grep "$TEAM_ID" | head -1 |
-      sed -E 's/.*"([^"]+)".*/\1/' || true)"
+      awk '{print $2}' || true)"
   fi
 
   if [ -z "$CODESIGN_IDENTITY" ] || [ -z "$INSTALLER_IDENTITY" ]; then
@@ -277,8 +286,26 @@ stage_plugins() {
     "$STAGING_DIR/au/Library/Audio/Plug-Ins/Components/$AU_NAME"
   /usr/bin/ditto --noextattr --norsrc "$VST3_SOURCE" \
     "$STAGING_DIR/vst3/Library/Audio/Plug-Ins/VST3/$VST3_NAME"
-  /usr/bin/ditto --noextattr --norsrc "$AAX_SOURCE" \
-    "$STAGING_DIR/aax/Library/Application Support/Avid/Audio/Plug-Ins/$AAX_NAME"
+  if is_truthy "$INCLUDE_AAX"; then
+    /usr/bin/ditto --noextattr --norsrc "$AAX_SOURCE" \
+      "$STAGING_DIR/aax/Library/Application Support/Avid/Audio/Plug-Ins/$AAX_NAME"
+  fi
+
+  local notices="$STAGING_DIR/standalone/Library/Application Support/DJW/Wave Emulation"
+  mkdir -p "$notices"
+  /usr/bin/ditto --noextattr --norsrc "$PROJECT_ROOT/data/BlankWave.img" \
+    "$notices/Blank Wave.img"
+  for file in LICENSE THIRD_PARTY_NOTICES.md; do
+    /usr/bin/ditto --noextattr --norsrc "$PROJECT_ROOT/$file" "$notices/$file"
+  done
+  /usr/bin/ditto --noextattr --norsrc "$PROJECT_ROOT/LICENSES" "$notices/LICENSES"
+  cat >"$notices/BUILD.txt" <<BUILD
+Wave Emulation $VERSION — macOS universal arm64/x86_64
+Modified version $RELEASE_LABEL by ${MODIFIED_BY:-Bronisław Hońca} (${MODIFIED_URL:-https://bronislawhonca.pl})
+Source repository: https://github.com/Bronislavus/wave (original: https://github.com/mo0kid/wave)
+Corresponding source archive: Wave Emulation $RELEASE_LABEL Source.zip (on this disk image)
+The default Blank Wave.img is included. Instrument firmware and other sound disks are supplied by the user.
+BUILD
 }
 
 sign_staged_plugins() {
@@ -336,32 +363,39 @@ build_packages() {
     "$PACKAGES_DIR/WaveEmulation_AU.pkg"
   build_component_package "$STAGING_DIR/vst3" "$PRODUCT_IDENTIFIER.vst3" \
     "$PACKAGES_DIR/WaveEmulation_VST3.pkg"
-  build_component_package "$STAGING_DIR/aax" "$PRODUCT_IDENTIFIER.aax" \
-    "$PACKAGES_DIR/WaveEmulation_AAX.pkg"
+  local aax_outline="" aax_choice="" aax_ref="" formats="AU and VST3"
+  if is_truthy "$INCLUDE_AAX"; then
+    build_component_package "$STAGING_DIR/aax" "$PRODUCT_IDENTIFIER.aax" \
+      "$PACKAGES_DIR/WaveEmulation_AAX.pkg"
+    aax_outline='<line choice="aax"/>'
+    aax_choice="<choice id=\"aax\" title=\"AAX\"><pkg-ref id=\"$PRODUCT_IDENTIFIER.aax\"/></choice>"
+    aax_ref="<pkg-ref id=\"$PRODUCT_IDENTIFIER.aax\" version=\"$VERSION\">WaveEmulation_AAX.pkg</pkg-ref>"
+    formats="AU, VST3 and AAX"
+  fi
 
   MODIFIED_BY="${MODIFIED_BY:-Bronisław Hońca}"
-  MODIFIED_DATE="${MODIFIED_DATE:-2026-09-27}"
+  MODIFIED_DATE="${MODIFIED_DATE:-2026-10-11}"
   MODIFIED_URL="${MODIFIED_URL:-https://bronislawhonca.pl}"
   cat >"$RESOURCES_DIR/welcome.html" <<WELCOME
 <!doctype html><html><head><meta charset="utf-8"></head>
 <body style="font-family:-apple-system,Helvetica Neue,sans-serif;padding:20px;font-size:13px">
 <h1 style="font-size:20px">$PRODUCT_NAME <span style="font-weight:normal;color:#666">$RELEASE_LABEL</span></h1>
-<p>This installer provides the Wave Emulation standalone app in /Applications, plus AU, VST3 and AAX instrument formats.</p>
+<p>This installer provides the Wave Emulation standalone app in /Applications, plus $formats instrument formats.</p>
 <h2 style="font-size:14px">Authors</h2>
 <p>Original software: <b>Wave Emulation</b> &copy; 2026 Dave Whiting
 (<a href="https://github.com/mo0kid/wave">github.com/mo0kid/wave</a>).</p>
 <p>This is a <b>modified version</b>, changed by $MODIFIED_BY
 (<a href="$MODIFIED_URL">${MODIFIED_URL#https://}</a>) on $MODIFIED_DATE:
-resizable editor window that fits the screen, zoom steps and shortcuts (Cmd +, Cmd &minus;, Cmd 0),
-compact layouts without the on-screen keyboard, remembered window size and layout.
-The sound engine is unchanged.</p>
+the editor opens at a size that fits your screen instead of the full 2338-pixel panel,
+remembers its zoom and keyboard visibility between sessions, and adds Fit to Screen
+(System menu or Cmd/Ctrl + Shift + 0). The sound engine is unchanged.</p>
 <h2 style="font-size:14px">License</h2>
 <p>Free software under the GNU General Public License, version 3 or later, with no warranty.
 The complete source code of this version is included on this disk image
 (<i>Wave Emulation $RELEASE_LABEL Source.zip</i>). JUCE is used under the AGPLv3; see the
 third-party notices on the disk image.</p>
-<p style="color:#666;font-size:11px">No Waldorf system firmware, sound sets or floppy images are included &ndash;
-supply your own Wave OS 1.700 files. Waldorf and Wave are trademarks of their respective owner;
+<p style="color:#666;font-size:11px">No Waldorf system firmware or factory sound sets are included (only an empty
+Blank Wave.img) &ndash; supply your own Wave OS 1.700 files. Waldorf and Wave are trademarks of their respective owner;
 this project is not affiliated with or endorsed by Waldorf Music.</p>
 </body></html>
 WELCOME
@@ -379,16 +413,16 @@ WELCOME
   <options customize="allow" require-scripts="false" hostArchitectures="arm64,x86_64"/>
   <volume-check><allowed-os-versions><os-version min="$CMAKE_OSX_DEPLOYMENT_TARGET"/></allowed-os-versions></volume-check>
   <choices-outline>
-    <line choice="standalone"/><line choice="au"/><line choice="vst3"/><line choice="aax"/>
+    <line choice="standalone"/><line choice="au"/><line choice="vst3"/>$aax_outline
   </choices-outline>
   <choice id="standalone" title="Standalone Application"><pkg-ref id="$PRODUCT_IDENTIFIER.standalone"/></choice>
   <choice id="au" title="Audio Unit"><pkg-ref id="$PRODUCT_IDENTIFIER.au"/></choice>
   <choice id="vst3" title="VST3"><pkg-ref id="$PRODUCT_IDENTIFIER.vst3"/></choice>
-  <choice id="aax" title="AAX"><pkg-ref id="$PRODUCT_IDENTIFIER.aax"/></choice>
+  $aax_choice
   <pkg-ref id="$PRODUCT_IDENTIFIER.standalone" version="$VERSION">WaveEmulation_Standalone.pkg</pkg-ref>
   <pkg-ref id="$PRODUCT_IDENTIFIER.au" version="$VERSION">WaveEmulation_AU.pkg</pkg-ref>
   <pkg-ref id="$PRODUCT_IDENTIFIER.vst3" version="$VERSION">WaveEmulation_VST3.pkg</pkg-ref>
-  <pkg-ref id="$PRODUCT_IDENTIFIER.aax" version="$VERSION">WaveEmulation_AAX.pkg</pkg-ref>
+  $aax_ref
 </installer-gui-script>
 DISTRIBUTION
 
@@ -461,6 +495,11 @@ build_dmg() {
   mkdir -p "$DMG_STAGING_DIR"
   /usr/bin/ditto --noextattr --norsrc "$FINAL_PKG" \
     "$DMG_STAGING_DIR/$FINAL_PKG_NAME"
+  /usr/bin/ditto --noextattr --norsrc "$PROJECT_ROOT/data/BlankWave.img" \
+    "$DMG_STAGING_DIR/Blank Wave.img"
+  /usr/bin/ditto --noextattr --norsrc \
+    "$STAGING_DIR/standalone/Library/Application Support/DJW/Wave Emulation" \
+    "$DMG_STAGING_DIR/License and Source Information"
   if [ -n "$MANUAL_PDF" ]; then
     /usr/bin/ditto --noextattr --norsrc "$MANUAL_PDF" \
       "$DMG_STAGING_DIR/$(basename "$MANUAL_PDF")"
@@ -473,9 +512,6 @@ build_dmg() {
     "$(basename "$PROJECT_ROOT")" \
     -x "*/build/*" "*/build-*/*" "*/.release-work/*" "*/Firmware/*" \
        "*.dmg" "*.pkg" "*.set" "*/.env.local" "*/.git/*" "*.DS_Store")
-  for doc in LICENSE THIRD_PARTY_NOTICES.md; do
-    /usr/bin/ditto --noextattr --norsrc "$PROJECT_ROOT/$doc" "$DMG_STAGING_DIR/$doc"
-  done
   rm -f "$FINAL_DMG"
   hdiutil create -volname "DJW $PRODUCT_NAME" -srcfolder "$DMG_STAGING_DIR" \
     -ov -format UDZO "$FINAL_DMG"
@@ -514,8 +550,10 @@ build_plugins
 validate_bundle "$APP_SOURCE"
 validate_bundle "$AU_SOURCE"
 validate_bundle "$VST3_SOURCE"
-validate_bundle "$AAX_SOURCE"
-wrap_aax
+if is_truthy "$INCLUDE_AAX"; then
+  validate_bundle "$AAX_SOURCE"
+  wrap_aax
+fi
 stage_plugins
 sign_staged_plugins
 build_packages

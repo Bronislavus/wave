@@ -492,6 +492,7 @@ bool applyFirmwareModifierRouting(
         if (!initialSource && hostSourceChanged)
         {
             storedSource = juce::jlimit(0, 39, hostSource);
+            effectiveSources[routeIndex] = storedSource;
             firmware.writeCurrentSoundRecordByte(
                 static_cast<uint32_t>(layout.sourceOffset),
                 static_cast<uint8_t>(storedSource));
@@ -527,6 +528,7 @@ bool applyFirmwareModifierRouting(
         if (layout.controlOffset >= 0 && !initialControl && hostControlChanged)
         {
             storedControl = juce::jlimit(0, 39, hostControl);
+            effectiveControls[routeIndex] = storedControl;
             firmware.writeCurrentSoundRecordByte(
                 static_cast<uint32_t>(layout.controlOffset),
                 static_cast<uint8_t>(storedControl));
@@ -579,6 +581,13 @@ bool applyFirmwareModifierRouting(
                                         ? (juce::roundToInt(hostAmount) + 8) * 8
                                         : juce::roundToInt(hostAmount) + 64;
             effectiveStoredAmount = juce::jlimit(0, 127, effectiveStoredAmount);
+            // A host write can coincide with an ADC edit. Since that write
+            // wins in the native record, it must also win in the published
+            // Sound; otherwise Instrument switching restores the older ADC
+            // amount even though the live record contains the host value.
+            effectiveAmounts[routeIndex] = layout.volumeAmount
+                ? static_cast<float>(effectiveStoredAmount / 8 - 8)
+                : static_cast<float>(effectiveStoredAmount - 64);
             firmware.writeCurrentSoundRecordByte(
                 static_cast<uint32_t>(layout.amountOffset),
                 static_cast<uint8_t>(effectiveStoredAmount));
@@ -592,7 +601,8 @@ bool applyFirmwareModifierRouting(
 }
 } // namespace
 
-WaveEmulationAudioProcessor::WaveEmulationAudioProcessor(const juce::File& preferenceFile)
+WaveEmulationAudioProcessor::WaveEmulationAudioProcessor(const juce::File& preferenceFile,
+                                                       InitialBank initialBank)
     : AudioProcessor(BusesProperties().withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       parameters(*this, nullptr, "WaveState", wave::parameters::createLayout()),
       firmwarePreferenceFile(preferenceFile == juce::File{}
@@ -618,6 +628,8 @@ WaveEmulationAudioProcessor::WaveEmulationAudioProcessor(const juce::File& prefe
                     std::memory_order_relaxed);
     for (auto& value : pendingFirmwareGlideValues)
         value.store(-1000, std::memory_order_relaxed);
+    for (auto& value : pendingGlideFaderEdits)
+        value.store(-1, std::memory_order_relaxed);
     lastFirmwarePanelPotRecordBytes.fill(-1);
     lastHostPanelPotValues.fill(std::numeric_limits<float>::quiet_NaN());
     lastFirmwareGlideRecordBytes.fill(-1);
@@ -644,10 +656,55 @@ WaveEmulationAudioProcessor::WaveEmulationAudioProcessor(const juce::File& prefe
         runtime.attachSharedMemory(sharedFirmwareMemory);
         runtime.setBoardIndex(board);
     }
-    loadEmbeddedFactorySet();
+    if (initialBank == InitialBank::embeddedFactory)
+        loadEmbeddedFactorySet();
     loadEmbeddedPrivateRoms();
-    applyFactoryProgram(0, false);
+    if (initialBank == InitialBank::embeddedFactory)
+        applyFactoryProgram(0, false);
     loadRememberedFirmware();
+    if (initialBank == InitialBank::embeddedFactory)
+        // The factory boot already installs Performance 0. A second recall
+        // from loading remembered firmware can discard early panel events.
+        pendingFirmwareProgram.store(-1, std::memory_order_release);
+    if (initialBank != InitialBank::embeddedFactory)
+    {
+        resetToColdStart();
+        // Each instance gets writable media independent of the bundled image.
+        // Host/session recall subsequently replaces this with its own image.
+        restoredHostStateDirectory = juce::File::getSpecialLocation(juce::File::tempDirectory)
+            .getChildFile(hostStateDirectoryName).getChildFile(hostStateInstanceId);
+        if (restoredHostStateDirectory.createDirectory().wasOk())
+        {
+            const auto image = restoredHostStateDirectory.getChildFile("Blank Wave.img");
+            if (initialBank == InitialBank::initialised)
+                (void) loadDefaultBank(image);
+            else
+                (void) createBlankDiskImage(image);
+        }
+    }
+}
+
+juce::Result WaveEmulationAudioProcessor::loadDefaultBank(const juce::File& image)
+{
+    if (!image.replaceWithData(WaveAssets::BlankWave_img,
+                               static_cast<size_t>(WaveAssets::BlankWave_imgSize)))
+        return juce::Result::fail("The default blank disk image could not be created.");
+    const auto mounted = mountDiskImage(image);
+    if (mounted.failed())
+        return mounted;
+    const auto set = currentPerformanceSet();
+    if (set == nullptr || !set->isLoaded())
+        return juce::Result::fail("The default disk image contains no valid Wave SET.");
+
+    // Startup loads the SET directly into native SRAM; it does not leave a
+    // Disk/Import confirmation or depend on a later user-triggered disk read.
+    pendingDiskSetActivation.store(false, std::memory_order_release);
+    pendingDiskSetBytes.store(0, std::memory_order_release);
+    diskSetImportConfirmationPending.store(false, std::memory_order_release);
+    masterFirmware.installSoundBank(set->soundBank());
+    masterFirmware.installPerformanceBank(set->performanceBank());
+    setCurrentProgram(0);
+    return juce::Result::ok();
 }
 
 WaveEmulationAudioProcessor::~WaveEmulationAudioProcessor()
@@ -694,10 +751,12 @@ juce::Result WaveEmulationAudioProcessor::mountDiskImage(const juce::File& image
 {
     returnToPerformanceAfterDiskImport.store(false,
                                              std::memory_order_release);
-    returnToPerformanceAfterStoreExit.store(false,
+    storeSaveCompletionPending.store(false, std::memory_order_release);
+    storeExitModePending.store(false,
                                             std::memory_order_release);
     pendingDiskSetBytes.store(0, std::memory_order_release);
     pendingDiskSetActivation.store(false, std::memory_order_release);
+    pendingManagerExitProgram.store(-1, std::memory_order_release);
     diskSetImportConfirmationPending.store(false,
                                            std::memory_order_release);
     const auto result = masterFirmware.mountDiskImage(image);
@@ -753,6 +812,19 @@ juce::Result WaveEmulationAudioProcessor::createBlankDiskImage(
     return mountDiskImage(output);
 }
 
+juce::Result WaveEmulationAudioProcessor::createDiskImageFromWavetable(
+    const juce::File& wavetable, const juce::File& destination)
+{
+    auto output = destination;
+    if (output.getFileExtension().isEmpty())
+        output = output.withFileExtension(".img");
+    const auto created = wave::firmware::DosFloppyImage::createWithWaveWavetable(
+        output, wavetable);
+    if (created.failed())
+        return created;
+    return mountDiskImage(output);
+}
+
 juce::Result WaveEmulationAudioProcessor::flushMountedDiskImage()
 {
     return masterFirmware.flushDiskImage();
@@ -802,16 +874,42 @@ juce::Result WaveEmulationAudioProcessor::ejectDiskImage()
     {
         pendingDiskSetBytes.store(0, std::memory_order_release);
         pendingDiskSetActivation.store(false, std::memory_order_release);
+        pendingManagerExitProgram.store(-1, std::memory_order_release);
         diskSetImportConfirmationPending.store(false,
                                                std::memory_order_release);
         returnToPerformanceAfterDiskImport.store(false,
                                                  std::memory_order_release);
-        returnToPerformanceAfterStoreExit.store(false,
+        storeSaveCompletionPending.store(false, std::memory_order_release);
+        storeExitModePending.store(false,
                                                 std::memory_order_release);
         removeRestoredHostStateDisk();
         parameters.state.removeProperty("mountedDiskImage", nullptr);
     }
     return result;
+}
+
+juce::Result WaveEmulationAudioProcessor::reloadBankFromMountedImage()
+{
+    const juce::ScopedLock callbackLock(getCallbackLock());
+    wave::firmware::DosFloppyImage::SetupFile setup;
+    const auto read = wave::firmware::DosFloppyImage::readWaveSetup(
+        masterFirmware.mountedDiskImageFile(), setup);
+    if (read.failed())
+        return read;
+    wave::presets::WaveFactorySet set;
+    if (!set.load(setup.data).validLayout)
+        return juce::Result::fail("The mounted image contains no valid Wave bank.");
+    juce::MemoryBlock saved;
+    getStateInformation(saved);
+    const auto xml = getXmlFromBinary(saved.getData(), static_cast<int>(saved.getSize()));
+    auto state = juce::ValueTree::fromXml(*xml);
+    state.setProperty("machineActiveSetData", juce::var(setup.data), nullptr);
+    state.setProperty("machineHasActiveSet", true, nullptr);
+    for (const auto* key : { "machinePerformanceSnapshot", "machineFirmwareEditBuffers" })
+        state.removeProperty(key, nullptr);
+    copyXmlToBinary(*state.createXml(), saved);
+    setStateInformation(saved.getData(), static_cast<int>(saved.getSize()));
+    return juce::Result::ok();
 }
 
 void WaveEmulationAudioProcessor::resetToColdStart()
@@ -825,9 +923,13 @@ void WaveEmulationAudioProcessor::resetToColdStart()
     instrumentEditPage.store(0, std::memory_order_release);
     for (auto& value : pendingInstrumentFaderEdits)
         value.store(-1, std::memory_order_release);
+    for (auto& value : pendingGlideFaderEdits)
+        value.store(-1, std::memory_order_release);
     instrumentPageReady.store(false, std::memory_order_release);
     startInstrumentPageSelectionDelay.store(false, std::memory_order_release);
     pendingFirmwareSoftButton.store(-1, std::memory_order_release);
+    pendingPanelCancel.store(false, std::memory_order_release);
+    pendingManagerExitProgram.store(-1, std::memory_order_release);
     pendingFirmwarePageButton.store(-1, std::memory_order_release);
     pendingFirmwareModeButton.store(-1, std::memory_order_release);
     pendingFirmwareGlideSwitchClicks.store(0, std::memory_order_release);
@@ -845,11 +947,13 @@ void WaveEmulationAudioProcessor::resetToColdStart()
     pendingPanelPerformance.store(-1, std::memory_order_release);
     pendingDiskSetBytes.store(0, std::memory_order_release);
     pendingDiskSetActivation.store(false, std::memory_order_release);
+    pendingManagerExitProgram.store(-1, std::memory_order_release);
     diskSetImportConfirmationPending.store(false,
                                            std::memory_order_release);
     returnToPerformanceAfterDiskImport.store(false,
                                              std::memory_order_release);
-    returnToPerformanceAfterStoreExit.store(false,
+    storeSaveCompletionPending.store(false, std::memory_order_release);
+    storeExitModePending.store(false,
                                             std::memory_order_release);
     keyboardOctaveShift.store(0, std::memory_order_release);
     pendingKeyboardOctaveRestore.store(2, std::memory_order_release);
@@ -921,6 +1025,11 @@ void WaveEmulationAudioProcessor::setCurrentProgram(int index)
     }
     const auto bounded = juce::jlimit(0, wave::presets::WaveFactorySet::programCount - 1,
                                       index);
+    const auto managerExitPending
+        = pendingManagerExitProgram.load(std::memory_order_acquire) >= 0;
+    const auto leaveCompletedStore = managerExitPending
+        || (storeMenuActive.load(std::memory_order_acquire)
+            && completedStoreMode.load(std::memory_order_acquire) >= 0);
     armPanelPotProgramRecallGuard();
     instrumentButtonMode.store(static_cast<int>(InstrumentButtonMode::normal),
                                std::memory_order_release);
@@ -928,7 +1037,12 @@ void WaveEmulationAudioProcessor::setCurrentProgram(int index)
     pendingInstrumentPageSelection.store(-1, std::memory_order_release);
     instrumentPageReady.store(false, std::memory_order_release);
     startInstrumentPageSelectionDelay.store(false, std::memory_order_release);
-    pendingFirmwareSoftButton.store(-1, std::memory_order_release);
+    if (!managerExitPending)
+    {
+        pendingFirmwareSoftButton.store(-1, std::memory_order_release);
+        pendingPanelCancel.store(false, std::memory_order_release);
+        pendingManagerExitProgram.store(-1, std::memory_order_release);
+    }
     pendingFirmwarePageButton.store(-1, std::memory_order_release);
     pendingFirmwareModeButton.store(-1, std::memory_order_release);
     panelModeDisplayTransitionActive.store(false, std::memory_order_release);
@@ -940,14 +1054,24 @@ void WaveEmulationAudioProcessor::setCurrentProgram(int index)
     // -/+ contacts are not misrouted to the page we just left.
     diskMenuActive.store(false, std::memory_order_release);
     storeMenuActive.store(false, std::memory_order_release);
-    returnToPerformanceAfterStoreExit.store(false,
+    storeSaveCompletionPending.store(false, std::memory_order_release);
+    storeExitModePending.store(false,
                                             std::memory_order_release);
     panelSelectedMode.store(39, std::memory_order_release);
     panelSelectedEdit.store(-1, std::memory_order_release);
     cancelPanelStepButtonEvents.store(true, std::memory_order_release);
     currentProgram = bounded;
     parameters.state.setProperty("factoryProgram", bounded, nullptr);
-    applyFactoryProgram(bounded, true);
+    applyFactoryProgram(bounded, !leaveCompletedStore);
+    if (leaveCompletedStore)
+    {
+        // A completed Store still owns the native chooser. Exit it before
+        // recalling the requested program, retaining one Cancel transaction
+        // while rapid browsing clicks update its destination.
+        pendingManagerExitProgram.store(bounded, std::memory_order_release);
+        if (!managerExitPending)
+            pendingPanelCancel.store(true, std::memory_order_release);
+    }
     updateHostDisplay(ChangeDetails{}.withProgramChanged(true)
                           .withNonParameterStateChanged(true));
 }
@@ -993,7 +1117,10 @@ bool WaveEmulationAudioProcessor::selectPerformanceInstrument(int instrument)
         return false;
     const auto current = std::atomic_load_explicit(
         &factoryPerformance, std::memory_order_acquire);
-    if (current == nullptr || !current->layers[static_cast<size_t>(instrument)].enabled)
+    if (current == nullptr
+        || (!current->layers[static_cast<size_t>(instrument)].enabled
+            && (panelSelectedMode.load(std::memory_order_acquire) != 36
+                || masterFirmware.currentInstrumentEditTarget() != instrument)))
         return false;
     static constexpr std::array instrumentCodes { 22, 25, 26, 27,
                                                    79, 28, 29, 30 };
@@ -1008,8 +1135,11 @@ bool WaveEmulationAudioProcessor::selectPerformanceInstrument(int instrument)
         if (physicalSelectionInFlight || !masterFirmware.isLoaded())
             return;
         cancelActiveInstrumentSelection.store(true, std::memory_order_release);
+        const auto firmwareTarget = panelSelectedMode.load(std::memory_order_acquire) == 36
+            ? masterFirmware.currentInstrumentEditTarget()
+            : masterFirmware.currentPerformanceInstrument();
         pendingFirmwareInstrument.store(
-            masterFirmware.currentPerformanceInstrument() == instrument
+            firmwareTarget == instrument
                 ? -1 : instrument,
             std::memory_order_release);
     };
@@ -1404,23 +1534,14 @@ void WaveEmulationAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         transposedLocalKeyboardMidi.addEvent(message, metadata.samplePosition);
     }
     localKeyboardMidi.swapWith(transposedLocalKeyboardMidi);
-    // Button 1/2 modes are owned by the keyboard firmware. Their genuine LED
-    // outputs are the authoritative latched/touch state presented to the two
-    // modulation sources; the editor never guesses a mode from mouse state.
-    constexpr std::array<int, 2> keyboardButtonLedSerials { 16, 35 };
-    for (size_t button = 0; button < keyboardButtonLedSerials.size(); ++button)
-    {
-        const auto state = masterFirmware.panelLed(
-                               keyboardButtonLedSerials[button])
-                               ? 1 : 0;
-        if (state == lastKeyboardAssignableButtonStates[button])
-            continue;
-        lastKeyboardAssignableButtonStates[button] = state;
-        localKeyboardMidi.addEvent(
-            juce::MidiMessage::controllerEvent(
-                1, 80 + static_cast<int>(button), state != 0 ? 127 : 0),
-            0);
-    }
+    // OS 1.700 owns touch/toggle mode and the lamps reflect its actual state.
+    // Do not disguise these dedicated sources as CC80/81: MIDI assignments
+    // are Performance bytes 4/5 and may coincide with each other or a wheel.
+    engine.setKeyboardButtons(masterFirmware.panelLed(16), masterFirmware.panelLed(35));
+    if (const auto performance = masterFirmware.currentPerformanceRecordOffset())
+        engine.setKeyboardButtonControllers(
+            masterFirmware.sharedProgramByte(*performance + 4u) & 0x7fu,
+            masterFirmware.sharedProgramByte(*performance + 5u) & 0x7fu);
     const auto selectionVersionBefore
         = performanceInstrumentSelectionVersion.load(std::memory_order_acquire);
     auto editedSound = wave::parameters::readSnapshot(parameters);
@@ -1577,52 +1698,16 @@ void WaveEmulationAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         for (size_t offset = 0; offset < liveRecord.size(); ++offset)
             liveRecord[offset] = masterFirmware.currentSoundRecordByte(
                 static_cast<uint32_t>(offset));
-        // During the initial SET import, OS 1.700 copies a nonzero Wavetable
-        // selector into its live edit buffer one count lower than the original
-        // Instrument-local record. Once that record is installed directly in
-        // the cache (or edited from the panel), it uses the normal selector.
-        // Reconcile that one import edge exactly once per Instrument. Treating
-        // every later live byte as import-encoded would increment the selector
-        // on every softbutton press; never reconciling it steps A045/A051 to an
-        // adjacent table as soon as their selected Instrument changes.
-        auto persistentRecord = liveRecord;
-        const auto selectedIndex = static_cast<size_t>(*firmwareInstrument);
-        if (!activeInstrumentSoundRecordReconciled[selectedIndex]
-            && activeInstrumentSoundPerformance == *firmwarePerformance
-            && activeInstrumentSoundRecordValid[selectedIndex])
-        {
-            const auto seededSelector
-                = activeInstrumentSoundRecords[selectedIndex][25];
-            if (liveRecord[25] < 0x7fu
-                && static_cast<uint8_t>(liveRecord[25] + 1u)
-                       == seededSelector)
-            {
-                persistentRecord[25] = seededSelector;
-                activeInstrumentSoundRecordReconciled[selectedIndex] = true;
-                activeInstrumentSoundRecordUsesImportEncoding[selectedIndex]
-                    = true;
-            }
-            else if (liveRecord[25] != seededSelector)
-            {
-                // A value other than the seed or its import encoding is a
-                // genuine edit, so this record is already in the live/cache
-                // representation from now on.
-                activeInstrumentSoundRecordReconciled[selectedIndex] = true;
-                activeInstrumentSoundRecordUsesImportEncoding[selectedIndex]
-                    = false;
-            }
-            // Equality can be observed briefly before the OS completes its
-            // import conversion. Keep waiting instead of prematurely marking
-            // this Instrument reconciled.
-        }
-        else if (activeInstrumentSoundRecordUsesImportEncoding[selectedIndex]
-                 && persistentRecord[25] < 0x7fu)
-        {
-            ++persistentRecord[25];
-        }
         publishHostMachineSnapshot(*firmwarePerformance, *firmwareInstrument,
-                                   persistentRecord);
-        firmwareSelectedSound = decodeFactorySound(persistentRecord);
+                                   liveRecord);
+        firmwareSelectedSound = decodeFactorySound(liveRecord);
+        // Store updates the firmware's Sound bank, while the originally loaded
+        // SET can still contain an older octave. Recall must follow the actual
+        // selected Sound bytes, just like the other native synthesis fields.
+        for (size_t oscillator = 0; oscillator < panelOscillatorOctaves.size(); ++oscillator)
+            panelOscillatorOctaves[oscillator].store(
+                firmwareSelectedSound->oscillatorOctaves[oscillator],
+                std::memory_order_release);
         // Modifier selectors also support host automation. The reconciliation
         // above has already resolved firmware edits versus a genuine host
         // change for this block, so retain only that resolved route set rather
@@ -1688,8 +1773,6 @@ void WaveEmulationAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
             renderedSound.panModulationMode = nativeSound.panModulationMode;
             renderedSound.driveDb = editedSound.driveDb;
             renderedSound.quickEditAmounts = editedSound.quickEditAmounts;
-            renderedSound.oscillatorOctaves[0] = getFirmwareOscillatorOctave(0);
-            renderedSound.oscillatorOctaves[1] = getFirmwareOscillatorOctave(1);
             wave::parameters::applyQuickEdit(renderedSound);
             performance.layers[static_cast<size_t>(editable)].sound = renderedSound;
         }
@@ -1816,8 +1899,7 @@ void WaveEmulationAudioProcessor::advanceFirmware(int samples)
             filterCalibrationServiceExitPending.store(false,
                                                       std::memory_order_release);
         }
-        const auto selected = (static_cast<int>(masterFirmware.localByte(0x54b40u)) << 8)
-                              | static_cast<int>(masterFirmware.localByte(0x54b41u));
+        auto selected = masterFirmware.currentPerformanceId().value_or(-1);
         auto refreshSelectedPerformancePage = false;
         const auto expected = pendingPanelPerformance.load(std::memory_order_acquire);
         if (expected >= 0)
@@ -1828,7 +1910,10 @@ void WaveEmulationAudioProcessor::advanceFirmware(int samples)
                 refreshSelectedPerformancePage = true;
             }
         }
-        else if (selected >= 0
+        else if (!pendingDiskSetActivation.load(std::memory_order_acquire)
+                 && pendingManagerExitProgram.load(std::memory_order_acquire) < 0
+                 && pendingFirmwareProgram.load(std::memory_order_acquire) < 0
+                 && selected >= 0
                  && selected < wave::presets::WaveFactorySet::programCount
                  && selected != currentProgram.load(std::memory_order_acquire))
         {
@@ -1838,23 +1923,55 @@ void WaveEmulationAudioProcessor::advanceFirmware(int samples)
         }
 
         // Mounting media only inserts the disk. Total Recall is complete once
-        // OS 1.700 has transferred at least the SET payload through the real
-        // FDC register path. Force one engine decode at that boundary because
+        // OS 1.700 has transferred the SET through the real FDC register path
+        // and closed its confirmation requester. Directory reads contribute
+        // to the byte count, so that count alone can fire during the load.
+        // Force one engine decode at that boundary because
         // A001 may have the same numeric index as the preceding empty INIT
         // state and therefore cannot be detected by an index-change test.
         if (pendingDiskSetActivation.load(std::memory_order_acquire)
             && masterFirmware.mountedDiskBytesRead()
                    >= pendingDiskSetBytes.load(std::memory_order_acquire)
-            && selected >= 0
-            && selected < wave::presets::WaveFactorySet::programCount)
+            && !firmwareRequesterActive.load(std::memory_order_acquire)
+            && !masterFirmware.panelButtonPressed(70))
         {
             pendingDiskSetActivation.store(false, std::memory_order_release);
+            if (diskSetImportConfirmationPending.exchange(
+                    false, std::memory_order_acq_rel)
+                && diskMenuActive.exchange(false, std::memory_order_acq_rel))
+            {
+                // Disk/Load needs more than one OK: the first opens the file
+                // selector, and the next starts Total Recall. Only the SET
+                // transfer proves the operation has finished.
+                panelSelectedMode.store(39, std::memory_order_release);
+                panelSelectedEdit.store(-1, std::memory_order_release);
+                panelModeDisplayTransitionActive.store(true,
+                                                       std::memory_order_release);
+                panelModeDisplayAwaitingDispatch.store(true,
+                                                       std::memory_order_release);
+                // Total Recall returns to the Disk manager. Exit that native
+                // workspace before selecting the new bank: a Performance
+                // contact alone is rejected while the manager owns input.
+                selected = 0;
+                pendingManagerExitProgram.store(selected, std::memory_order_release);
+                pendingPanelCancel.store(true, std::memory_order_release);
+            }
+            if (const auto set = currentPerformanceSet(); set != nullptr)
+            {
+                masterFirmware.installSoundBank(set->soundBank());
+                masterFirmware.installPerformanceBank(set->performanceBank());
+            }
             pendingEngineProgram.store(selected, std::memory_order_release);
             triggerAsyncUpdate();
             refreshSelectedPerformancePage = true;
         }
-        if (refreshSelectedPerformancePage)
+        if (refreshSelectedPerformancePage
+            && !storeMenuActive.load(std::memory_order_acquire)
+            && pendingManagerExitProgram.load(std::memory_order_acquire) < 0)
         {
+            // Total Recall still needs the Disk Manager's Cancel callbacks
+            // until its exit transaction finishes. The subsequent program
+            // recall supplies the Performance redraw after that release.
             installFactoryEditRecords(selected);
             masterFirmware.refreshCurrentScreenFromFirmware();
         }
@@ -1914,10 +2031,14 @@ void WaveEmulationAudioProcessor::handleAsyncUpdate()
         // Recall from disk) also retires the preceding Disk/Option context.
         // The LCD remains firmware-owned; this only synchronises subsequent
         // serial-button routing and the mutually-exclusive mode lamps.
-        diskMenuActive.store(false, std::memory_order_release);
-        storeMenuActive.store(false, std::memory_order_release);
-        panelSelectedMode.store(39, std::memory_order_release);
-        panelSelectedEdit.store(-1, std::memory_order_release);
+        // Store selects its destination while its dialog still owns input.
+        // Keep that context until Cancel completes the native exit.
+        if (!storeMenuActive.load(std::memory_order_acquire))
+        {
+            diskMenuActive.store(false, std::memory_order_release);
+            panelSelectedMode.store(39, std::memory_order_release);
+            panelSelectedEdit.store(-1, std::memory_order_release);
+        }
         currentProgram.store(selected, std::memory_order_release);
         parameters.state.setProperty("factoryProgram", selected, nullptr);
         // OS 1.700 has already performed the selection and owns the LCD. Decode
@@ -2010,8 +2131,55 @@ void WaveEmulationAudioProcessor::synchroniseInstrumentSoundSeed() noexcept
     activeInstrumentSoundPerformance = seed->performance;
     activeInstrumentSoundRecords = seed->records;
     activeInstrumentSoundRecordValid = seed->valid;
-    activeInstrumentSoundRecordReconciled.fill(false);
-    activeInstrumentSoundRecordUsesImportEncoding.fill(false);
+    // The imported SET is only an initial seed. Native Store updates the bank
+    // in SRAM, so a new Performance must create its private Instrument edits
+    // from those saved records, not resurrect the SET's older parameter bytes.
+    const auto performanceOffset = 0x28000u
+                                   + static_cast<uint32_t>(seed->performance) * 512u;
+    if (masterFirmware.isLoaded()
+        && masterFirmware.sharedProgramByte(performanceOffset + 48u) == 0x55u)
+    {
+        for (size_t instrument = 0; instrument < activeInstrumentSoundRecords.size(); ++instrument)
+        {
+            const auto assignment = performanceOffset + 64u
+                                    + static_cast<uint32_t>(instrument) * 32u;
+            const auto soundId = (masterFirmware.sharedProgramByte(assignment)
+                                 | (masterFirmware.sharedProgramByte(assignment + 1u) << 7u)) & 0xffu;
+            const auto soundOffset = 0x18000u + static_cast<uint32_t>(soundId) * 256u;
+            auto& record = activeInstrumentSoundRecords[instrument];
+            std::array<uint8_t, wave::presets::WaveFactorySet::soundSize> stored {};
+            for (size_t byte = 0; byte < stored.size(); ++byte)
+                stored[byte] = masterFirmware.sharedProgramByte(
+                    soundOffset + static_cast<uint32_t>(byte));
+            // An unpopulated startup slot still needs the imported seed.
+            if (std::any_of(stored.begin(), stored.end(), [](uint8_t byte) { return byte != 0; }))
+                record = stored;
+        }
+        // Unselected layers also sound immediately after recall. Refresh their
+        // DSP snapshots at the same boundary as their private edit buffers.
+        const auto current = std::atomic_load_explicit(&factoryPerformance, std::memory_order_acquire);
+        if (current != nullptr)
+        {
+            auto recalled = std::make_shared<wave::dsp::WaldorfEngine::PerformanceSnapshot>(*current);
+            for (size_t instrument = 0; instrument < recalled->layers.size(); ++instrument)
+            {
+                if (!activeInstrumentSoundRecordValid[instrument])
+                    continue;
+                auto& sound = recalled->layers[instrument].sound;
+                auto saved = decodeFactorySound(activeInstrumentSoundRecords[instrument]);
+                saved.panAmount = sound.panAmount;
+                saved.panModulationMode = sound.panModulationMode;
+                saved.driveDb = sound.driveDb;
+                saved.quickEditAmounts = sound.quickEditAmounts;
+                saved.outputDb = sound.outputDb;
+                saved.circuitAgeAmount = sound.circuitAgeAmount;
+                sound = saved;
+            }
+            std::atomic_store_explicit(&factoryPerformance,
+                std::static_pointer_cast<const wave::dsp::WaldorfEngine::PerformanceSnapshot>(recalled),
+                std::memory_order_release);
+        }
+    }
     appliedInstrumentSoundSeed = seed;
 }
 
@@ -2092,9 +2260,6 @@ void WaveEmulationAudioProcessor::applyPendingHostMachineRestore() noexcept
     activeInstrumentSoundPerformance = pending->performance;
     activeInstrumentSoundRecords = pending->soundRecords;
     activeInstrumentSoundRecordValid = pending->soundRecordValid;
-    activeInstrumentSoundRecordReconciled.fill(false);
-    activeInstrumentSoundRecordUsesImportEncoding.fill(false);
-    activeInstrumentSoundRecordReconciled[static_cast<size_t>(selected)] = true;
     masterFirmware.refreshCurrentScreenFromFirmware();
     suspendFirmwareSoundFeedback();
     modulationRoutingResetPending.store(true, std::memory_order_release);
@@ -2125,23 +2290,10 @@ void WaveEmulationAudioProcessor::stageFirmwareInstrumentSound(
     {
         const auto currentIndex = static_cast<size_t>(*currentInstrument);
         auto& currentRecord = activeInstrumentSoundRecords[currentIndex];
-        const auto previousPersistentSelector = currentRecord[25];
         for (size_t offset = 0;
              offset < wave::presets::WaveFactorySet::soundSize; ++offset)
             currentRecord[offset] = masterFirmware.currentSoundRecordByte(
                 static_cast<uint32_t>(offset));
-        if (activeInstrumentSoundRecordUsesImportEncoding[currentIndex]
-            && currentRecord[25] < 0x7fu)
-            ++currentRecord[25];
-        else if (!activeInstrumentSoundRecordReconciled[currentIndex]
-                 && currentRecord[25] < 0x7fu
-                 && static_cast<uint8_t>(currentRecord[25] + 1u)
-                        == previousPersistentSelector)
-        {
-            currentRecord[25] = previousPersistentSelector;
-            activeInstrumentSoundRecordUsesImportEncoding[currentIndex] = true;
-        }
-        activeInstrumentSoundRecordReconciled[currentIndex] = true;
     }
 
     // Two Instruments may intentionally assign the same stored Sound number
@@ -2152,10 +2304,6 @@ void WaveEmulationAudioProcessor::stageFirmwareInstrumentSound(
     masterFirmware.installPerformanceInstrumentSoundRecord(
         targetInstrument,
         activeInstrumentSoundRecords[static_cast<size_t>(targetInstrument)]);
-    activeInstrumentSoundRecordReconciled[static_cast<size_t>(targetInstrument)]
-        = true;
-    activeInstrumentSoundRecordUsesImportEncoding[static_cast<size_t>(targetInstrument)]
-        = false;
     suspendFirmwareSoundFeedback();
     modulationRoutingResetPending.store(true, std::memory_order_release);
 }
@@ -2163,7 +2311,52 @@ void WaveEmulationAudioProcessor::stageFirmwareInstrumentSound(
 void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& midi,
                                                        int sampleCount)
 {
+    if (pendingNumericPanelInput.exchange(false, std::memory_order_acq_rel))
+        masterFirmware.prepareNumericPanelInput();
+    // The lower keyboard switches send serial press=1/release=0 events.
+    // Keep each edge until the genuine callback has applied its state: OS
+    // background work can consume a packet without dispatching it.
+    if (activeKeyboardButtonEvent >= 0)
+    {
+        const auto button = static_cast<uint32_t>(activeKeyboardButtonEvent >> 1);
+        const auto serial = static_cast<uint8_t>(3u + button);
+        const auto down = static_cast<uint8_t>(activeKeyboardButtonEvent & 1);
+        const auto pending = masterFirmware.panelEventPending(0x80u, serial, down);
+        if (!pending && masterFirmware.localByte(0x58f78u + button)
+                            == activeKeyboardButtonExpectedState)
+        {
+            if (down == 0u)
+                masterFirmware.releasePanelEventLatch(serial);
+            activeKeyboardButtonEvent = -1;
+        }
+        else if (!pending && --keyboardButtonRetryBlocks <= 0)
+        {
+            masterFirmware.pushPanelEvent(0x80u, serial, down);
+            keyboardButtonRetryBlocks = 8;
+        }
+    }
+    if (activeKeyboardButtonEvent < 0)
+    {
+        const auto event = keyboardButtonEventFifo.read(1);
+        if (event.blockSize1 != 0)
+        {
+            const auto packed = keyboardButtonEvents[static_cast<size_t>(event.startIndex1)];
+            const auto button = static_cast<uint32_t>(packed >> 1u);
+            const auto down = static_cast<uint8_t>(packed & 1u);
+            const auto state = masterFirmware.localByte(0x58f78u + button) != 0u;
+            const auto record = masterFirmware.currentPerformanceRecordOffset();
+            const auto toggle = record.has_value()
+                && masterFirmware.sharedProgramByte(*record + 6u + button) != 0u;
+            activeKeyboardButtonExpectedState = toggle ? (down != 0u ? !state : state)
+                                                       : down != 0u;
+            activeKeyboardButtonEvent = packed;
+            keyboardButtonRetryBlocks = 8;
+            masterFirmware.pushPanelEvent(0x80u, static_cast<uint8_t>(3u + button), down);
+        }
+    }
     synchroniseInstrumentSoundSeed();
+    if (const auto page = masterFirmware.currentInstrumentEditPage())
+        instrumentEditPage.store(*page, std::memory_order_release);
     instrumentFaderRecordBaselineValid = false;
     if (panelSelectedMode.load(std::memory_order_acquire) == 36
         && panelSelectedEdit.load(std::memory_order_acquire) < 0
@@ -2179,7 +2372,7 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
             const auto instrument = (packedEdit >> 8) & 0x07;
             const auto firmwarePerformance = masterFirmware.currentPerformanceId();
             const auto firmwareInstrument
-                = masterFirmware.currentPerformanceInstrument();
+                = masterFirmware.currentInstrumentEditTarget();
             const auto record = masterFirmware.currentPerformanceRecordOffset();
             if (firmwarePerformance.has_value()
                 && firmwareInstrument.has_value() && record.has_value()
@@ -2204,8 +2397,13 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
     }
     const auto cancelStepEvents = cancelPanelStepButtonEvents.exchange(
         false, std::memory_order_acq_rel);
+    const auto completedPerformanceStore
+        = storeMenuActive.load(std::memory_order_acquire)
+          && completedStoreMode.load(std::memory_order_acquire) == 39
+          && !firmwareRequesterActive.load(std::memory_order_acquire);
     const auto performanceOwnsStepping
-        = panelSelectedMode.load(std::memory_order_acquire) == 39
+        = (panelSelectedMode.load(std::memory_order_acquire) == 39
+           || completedPerformanceStore)
           && panelSelectedEdit.load(std::memory_order_acquire) < 0;
     if (cancelStepEvents || performanceOwnsStepping)
     {
@@ -2266,8 +2464,8 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
         std::memory_order_release);
     // Requesters replace the otherwise inert CANCEL and OK action callbacks
     // in the OS-owned front-panel action table. This is the firmware's modal
-    // state, independent of LCD text or editor state. While either callback
-    // is installed, the physical panel accepts only those two contacts.
+    // state, independent of LCD text or editor state. The requester owns
+    // the panel; name editors also retain their cursor controls.
     const auto installedCancelAction
         = readFirmwareLong(cancelActionCallback);
     const auto installedOkAction = readFirmwareLong(okActionCallback);
@@ -2277,6 +2475,31 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
     // closes. This is the genuine firmware modal level, not an LCD heuristic.
     firmwareRequesterActive.store(
         installedCancelAction != installedOkAction,
+        std::memory_order_release);
+    if (storeSaveCompletionPending.load(std::memory_order_acquire)
+        && installedCancelAction == installedOkAction
+        && !masterFirmware.panelButtonPressed(70))
+    {
+        // The naming requester has closed after OK. Store retains its native
+        // chooser for another save and redraws the preceding operating page.
+        // Restore that page's lamp as well: the record type being saved does
+        // not select a new operating mode in the native OS.
+        storeSaveCompletionPending.store(false, std::memory_order_release);
+        completedStoreMode.store(storeReturnMode.load(std::memory_order_acquire),
+                                 std::memory_order_release);
+    }
+    // Total Recall asks about optional machine-specific calibration only after
+    // the Sound/Performance banks have transferred. CANCEL here means "No";
+    // it does not cancel the SET load or require reading its optional tail.
+    firmwareDiskCalibrationRequesterActive.store(
+        installedCancelAction == 0x0001f494u
+            && installedOkAction == 0x0001f488u,
+        std::memory_order_release);
+    // OS 1.700 installs these Page callbacks for DOS name entry (including
+    // Format's Diskname). Detect the actual editor, independent of panel mode.
+    firmwareDiskNameEditorActive.store(
+        readFirmwareLong(0x56698u) == 0x00013c1cu
+            && readFirmwareLong(0x566a8u) == 0x00013c34u,
         std::memory_order_release);
     if (cancelInstrumentPanelEvents.exchange(false, std::memory_order_acq_rel))
     {
@@ -2311,6 +2534,11 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
         activeSoftButtonRetryCount = 0;
         activeSoftButtonInitialLcd.fill(0);
     }
+    if (pendingPanelCancel.exchange(false, std::memory_order_acq_rel))
+    {
+        masterFirmware.releasePanelEventLatch(71);
+        pendingFirmwareSoftButton.store(71, std::memory_order_release);
+    }
     if (cancelInstrumentPageSelection.exchange(false, std::memory_order_acq_rel))
     {
         pendingInstrumentPageSelection.store(-1, std::memory_order_release);
@@ -2335,15 +2563,26 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
     const auto shiftDown = keyboardControllerShiftDown.load(std::memory_order_acquire);
     if (shiftDown != firmwareKeyboardShiftDown)
     {
-        // The keyboard assembly reports its labelled ASCII command and the
-        // panel-event edge consumed by the Store page. Feed both genuine
-        // serial paths; the engine does not alter the firmware modifier or LCD.
-        masterFirmware.pushPanelEvent(0x80u, 83u, shiftDown ? 1u : 0u);
         firmwareKeyboardShiftDown = shiftDown;
+        firmwareKeyboardShiftRetryBlocks = 0;
+    }
+    if (shiftDown != (masterFirmware.localByte(0x59869u) != 0u)
+        && !masterFirmware.panelEventPending(0x80u, 83u, shiftDown ? 1u : 0u)
+        && --firmwareKeyboardShiftRetryBlocks <= 0)
+    {
+        // Serial 83 maps to native action 83, the keyboard Shift modifier.
+        // The Store page can consume this edge during redraw.
+        // Retry until its genuine handler acknowledges the physical state.
+        masterFirmware.pushPanelEvent(0x80u, 83u, shiftDown ? 1u : 0u);
+        firmwareKeyboardShiftRetryBlocks = 8;
     }
 
-    if (const auto requestedProgram = pendingFirmwareProgram.exchange(
-            -1, std::memory_order_acq_rel);
+    // A newer click can arrive while the previous program-change handler
+    // still owns its tagged MIDI cursor and edit records. Keep the latest
+    // destination queued until that recall finishes, rather than replacing
+    // its tag and stranding the held LCD frame.
+    if (const auto requestedProgram = masterFirmware.performanceSelectionPending()
+            ? -1 : pendingFirmwareProgram.exchange(-1, std::memory_order_acq_rel);
         requestedProgram >= 0)
     {
         pendingFirmwareGlideSwitchClicks.store(0, std::memory_order_release);
@@ -2414,7 +2653,9 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
                      0x80u,
                      static_cast<uint8_t>(activeInstrumentPanelDiagnosticCode),
                      1u)
-                 && masterFirmware.currentPerformanceInstrument()
+                 && (panelSelectedMode.load(std::memory_order_acquire) == 36
+                         ? masterFirmware.currentInstrumentEditTarget()
+                         : masterFirmware.currentPerformanceInstrument())
                  == activeInstrumentPanelTarget)
         {
             masterFirmware.releasePanelActionBit(
@@ -2615,9 +2856,9 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
             -1, std::memory_order_acq_rel);
         requestedPageButton >= 0)
     {
-        // OS 1.700 installs a pair of native callbacks for each direction on
-        // the current screen. Invoke that pair once instead of entering the
-        // unusually fast Page-key auto-repeat scheduler.
+        // OS 1.700 installs a pair of native callbacks for each direction,
+        // including name-cursor movement in Store. Invoke the pair once so
+        // a brief host click cannot be lost in the key-repeat scheduler.
         masterFirmware.navigatePageWithFirmware(requestedPageButton == 23);
     }
     if (activeSoftButtonDiagnosticCode >= 0)
@@ -2631,13 +2872,16 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
             activeSoftButtonHoldBlocks = 0;
         }
         else if (!activeSoftButtonAccepted
-                 && masterFirmware.panelActionBitActive(
-                     activeSoftButtonDiagnosticCode))
+                 && (masterFirmware.panelActionBitActive(activeSoftButtonDiagnosticCode)
+                     || (activeSoftButtonDiagnosticCode == 71
+                         && (masterFirmware.localByte(0x58feau) & 2u) != 0u)))
         {
             // The display-action bit is set only after OS 1.700 has accepted
             // this softkey and entered the current Wave Edit menu handler.
             activeSoftButtonAccepted = true;
-            activeSoftButtonHoldBlocks = 32;
+            // CANCEL is dispatched on release. Its press is acknowledged in
+            // the OK/CANCEL chord latch, not the display-softkey action bits.
+            activeSoftButtonHoldBlocks = activeSoftButtonDiagnosticCode == 71 ? 0 : 32;
         }
         else if (!activeSoftButtonAccepted
                  && masterFirmware.panelEventPending(
@@ -2679,11 +2923,15 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
             if (changed
                 && readFirmwareLong(cancelActionCallback)
                        != readFirmwareLong(okActionCallback))
+            {
                 // A requester may reuse the handlers installed by the
                 // preceding requester. The LCD transition produced by a newly
                 // accepted softkey is therefore the second genuine open edge.
                 firmwareRequesterActive.store(true,
                                               std::memory_order_release);
+                if (storeMenuActive.load(std::memory_order_acquire))
+                    completedStoreMode.store(-1, std::memory_order_release);
+            }
             masterFirmware.pushPanelEvent(
                 0x80u, static_cast<uint8_t>(activeSoftButtonDiagnosticCode), 0u);
             activeSoftButtonReleaseSent = true;
@@ -2703,6 +2951,29 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
             // surviving display bit here cannot duplicate or cancel it.
             masterFirmware.releasePanelActionBit(
                 activeSoftButtonDiagnosticCode);
+            if (activeSoftButtonDiagnosticCode == 71
+                && storeExitModePending.exchange(false, std::memory_order_acq_rel))
+            {
+                panelModeDisplayTransitionActive.store(true, std::memory_order_release);
+                panelModeDisplayAwaitingDispatch.store(true, std::memory_order_release);
+                const auto mode = storeExitMode.load(std::memory_order_acquire);
+                pendingFirmwareModeButton.store(mode, std::memory_order_release);
+                if (mode == 36)
+                    startInstrumentPageSelectionDelay.store(true, std::memory_order_release);
+            }
+            if (activeSoftButtonDiagnosticCode == 71)
+            {
+                if (const auto program = pendingManagerExitProgram.exchange(
+                        -1, std::memory_order_acq_rel); program >= 0)
+                {
+                    // A newer browsing click can arrive as Cancel retires.
+                    // Preserve that newer request rather than replacing it.
+                    auto empty = -1;
+                    pendingFirmwareProgram.compare_exchange_strong(
+                        empty, program, std::memory_order_release,
+                        std::memory_order_relaxed);
+                }
+            }
             activeSoftButtonDiagnosticCode = -1;
             activeSoftButtonPressSent = false;
             activeSoftButtonAccepted = false;
@@ -2739,13 +3010,17 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
         scheduledInstrumentPageSelection = requestedSelection;
     if (scheduledInstrumentPageSelection >= 0
         && panelSelectedMode.load(std::memory_order_acquire) == 36
+        && !storeExitModePending.load(std::memory_order_acquire)
         && activeSoftButtonDiagnosticCode < 0
         && pendingFirmwareSoftButton.load(std::memory_order_acquire) < 0)
     {
         if (scheduledInstrumentPageDelayBlocks > 0)
             --scheduledInstrumentPageDelayBlocks;
-        else
+        else if (masterFirmware.currentInstrumentEditPage().has_value())
         {
+            // A Store exit can take longer than the nominal mode-button hold.
+            // Its chooser owns these same eight softkeys until OS 1.700 has
+            // actually installed Instrument Edit's callbacks.
             pendingFirmwareInstrument.store(scheduledInstrumentPageSelection,
                                             std::memory_order_release);
             scheduledInstrumentPageSelection = -1;
@@ -2775,11 +3050,12 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
     // the scan lets the OS finish processing the preceding fader position and
     // replace the newly committed Performance byte with its stale value.
     sendPendingInstrumentFadersToFirmware();
+    sendPendingGlideFadersToFirmware();
     // Instrument Edit pages beyond Page 1 are interpreted by the real OS.
     // Feed the resulting native Instrument record back into the audio engine;
     // the panel never supplies DSP values directly and the LCD remains solely
     // firmware-driven.
-    synchroniseCurrentPerformanceInstrumentFromFirmware();
+    synchronisePerformanceInstrumentsFromFirmware();
 
     // A mode button's serial press/release transaction remains alive after
     // its LCD page has finished rasterising. Publish as soon as the firmware
@@ -2847,9 +3123,13 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
                     false, std::memory_order_release);
         }
     }
-    if (panelSelectedMode.load(std::memory_order_acquire) == 36)
+    if (panelSelectedMode.load(std::memory_order_acquire) == 36
+        && instrumentPageReady.load(std::memory_order_acquire))
     {
-        const auto firmwareInstrument = masterFirmware.currentPerformanceInstrument();
+        // The page target still belongs to the preceding visit until the
+        // queued Instrument selection is acknowledged. Reading it during
+        // mode entry changes the engine's layer (and Sound) behind the LCD.
+        const auto firmwareInstrument = masterFirmware.currentInstrumentEditTarget();
         if (firmwareInstrument.has_value()
             && *firmwareInstrument != getSelectedPerformanceInstrument())
             selectPerformanceInstrument(*firmwareInstrument);
@@ -2897,9 +3177,18 @@ void WaveEmulationAudioProcessor::sendPendingInstrumentFadersToFirmware()
 {
     if (!masterFirmware.isLoaded())
         return;
+    const auto firmwarePage = masterFirmware.currentInstrumentEditPage();
+    if (firmwarePage.has_value())
+        instrumentEditPage.store(*firmwarePage, std::memory_order_release);
+    if (!firmwarePage.has_value()
+        && panelSelectedMode.load(std::memory_order_acquire) == 36
+        && panelSelectedEdit.load(std::memory_order_acquire) < 0
+        && (panelModeDisplayTransitionActive.load(std::memory_order_acquire)
+            || !instrumentPageReady.load(std::memory_order_acquire)))
+        return; // Retain the edge until the native page has finished opening.
     if (panelSelectedMode.load(std::memory_order_acquire) != 36
         || panelSelectedEdit.load(std::memory_order_acquire) >= 0
-        || instrumentEditPage.load(std::memory_order_acquire) > 1)
+        || !firmwarePage.has_value() || *firmwarePage > 1)
     {
         for (auto& edit : pendingInstrumentFaderEdits)
             edit.store(-1, std::memory_order_release);
@@ -2907,7 +3196,7 @@ void WaveEmulationAudioProcessor::sendPendingInstrumentFadersToFirmware()
     }
 
     static constexpr std::array<uint32_t, 8> pageOneRecordOffsets {
-        4u, 5u, 7u, 8u, 9u, 10u, 2u, 3u
+        4u, 5u, 7u, 12u, 9u, 10u, 2u, 3u // firmware table 0x14BCA
     };
     static constexpr std::array<uint32_t, 8> pageTwoRecordOffsets {
         4u, 5u, 7u, 21u, 22u, 15u, 16u, 11u
@@ -2918,7 +3207,7 @@ void WaveEmulationAudioProcessor::sendPendingInstrumentFadersToFirmware()
         &factoryPerformance, std::memory_order_acquire);
     std::shared_ptr<wave::dsp::WaldorfEngine::PerformanceSnapshot> changed;
     const auto firmwarePerformance = masterFirmware.currentPerformanceId();
-    const auto firmwareInstrument = masterFirmware.currentPerformanceInstrument();
+    const auto firmwareInstrument = masterFirmware.currentInstrumentEditTarget();
 
     for (size_t fader = 0; fader < pendingInstrumentFaderEdits.size(); ++fader)
     {
@@ -2930,6 +3219,7 @@ void WaveEmulationAudioProcessor::sendPendingInstrumentFadersToFirmware()
         const auto instrument = (packed >> 8) & 0x07;
         const auto page = (packed >> 19) & 0x03;
         const auto physical = packed & 0x7f;
+        const auto adc = (packed >> 21) & 0xff;
         if (program != currentProgram.load(std::memory_order_acquire))
         {
             pendingInstrumentFaderEdits[fader].store(-1,
@@ -2945,9 +3235,13 @@ void WaveEmulationAudioProcessor::sendPendingInstrumentFadersToFirmware()
             // selected during the transition.
             continue;
         }
-        if (page != instrumentEditPage.load(std::memory_order_acquire)
-            || page > 1)
+        if (page != *firmwarePage)
+        {
+            // An edge queued for a page that has since closed cannot be
+            // applied to a field occupying the same fader on the new page.
+            pendingInstrumentFaderEdits[fader].store(-1, std::memory_order_release);
             continue;
+        }
 
         auto stored = physical;
         if (page == 0)
@@ -2967,8 +3261,20 @@ void WaveEmulationAudioProcessor::sendPendingInstrumentFadersToFirmware()
             switch (fader)
             {
                 case 3: stored = (physical * 11 + 63) / 127; break;
-                // Thirteen native choices: global through MIDI Tune.
-                case 4: stored = (physical * 12 + 63) / 127; break;
+                case 4:
+                {
+                    // Match the firmware's displayed TuneTable transition at
+                    // each raw ADC value, including odd values that share the
+                    // same seven-bit position as their even neighbour.
+                    static constexpr std::array<int, 12> thresholds {
+                        21, 41, 61, 81, 101, 121,
+                        139, 159, 179, 199, 219, 239
+                    };
+                    stored = static_cast<int>(std::upper_bound(
+                        thresholds.begin(), thresholds.end(), adc)
+                                              - thresholds.begin());
+                    break;
+                }
                 case 5: stored = (physical * 22 + 63) / 127; break;
                 case 6: stored = (physical * 4 + 63) / 127; break;
                 case 7: stored = (physical * 3 + 63) / 127; break;
@@ -3049,7 +3355,7 @@ void WaveEmulationAudioProcessor::sendPendingInstrumentFadersToFirmware()
         const auto currentFirmwarePerformance
             = masterFirmware.currentPerformanceId();
         const auto currentFirmwareInstrument
-            = masterFirmware.currentPerformanceInstrument();
+            = masterFirmware.currentInstrumentEditTarget();
         if (currentFirmwarePerformance.has_value()
             && currentFirmwareInstrument.has_value()
             && *currentFirmwarePerformance == instrumentFaderBaselinePerformance
@@ -3072,94 +3378,171 @@ void WaveEmulationAudioProcessor::sendPendingInstrumentFadersToFirmware()
             std::memory_order_release);
 }
 
-void WaveEmulationAudioProcessor::synchroniseCurrentPerformanceInstrumentFromFirmware()
+void WaveEmulationAudioProcessor::synchronisePerformanceInstrumentsFromFirmware()
     noexcept
 {
     if (!masterFirmware.isLoaded())
         return;
 
+    // A cold start has no active bank. The OS's safe INIT records may enable
+    // Instruments, but must not repopulate the intentionally empty DSP bank.
+    const auto set = currentPerformanceSet();
+    if (set == nullptr || !set->isLoaded())
+        return;
+
     const auto current = std::atomic_load_explicit(
         &factoryPerformance, std::memory_order_acquire);
     const auto firmwarePerformance = masterFirmware.currentPerformanceId();
-    const auto firmwareInstrument = masterFirmware.currentPerformanceInstrument();
+    const auto firmwareInstrument = panelSelectedMode.load(std::memory_order_acquire) == 36
+        ? masterFirmware.currentInstrumentEditTarget()
+        : masterFirmware.currentPerformanceInstrument();
     const auto performanceRecord = masterFirmware.currentPerformanceRecordOffset();
     if (current == nullptr || !firmwarePerformance.has_value()
         || !firmwareInstrument.has_value() || !performanceRecord.has_value()
         || *firmwarePerformance != currentProgram.load(std::memory_order_acquire)
-        || *firmwareInstrument != current->editableLayer
         || *firmwareInstrument < 0 || *firmwareInstrument >= 8)
         return;
 
-    constexpr uint32_t instrumentTable = 64u;
-    constexpr uint32_t instrumentRecordSize = 32u;
-    const auto base = *performanceRecord + instrumentTable
-                      + static_cast<uint32_t>(*firmwareInstrument)
-                            * instrumentRecordSize;
-    const auto byte = [this, base](uint32_t offset) {
-        return static_cast<int>(masterFirmware.sharedProgramByte(base + offset)
-                                & 0x7fu);
-    };
+    // Store can replace every Instrument in the destination Performance.
+    // Synchronise all eight records so inactive source slots also clear the
+    // destination's playback layers and panel indicators.
+    std::shared_ptr<wave::dsp::WaldorfEngine::PerformanceSnapshot> changed;
+    for (int instrument = 0; instrument < 8; ++instrument)
+    {
+        constexpr uint32_t instrumentTable = 64u;
+        constexpr uint32_t instrumentRecordSize = 32u;
+        const auto base = *performanceRecord + instrumentTable
+                          + static_cast<uint32_t>(instrument)
+                                * instrumentRecordSize;
+        const auto byte = [this, base](uint32_t offset) {
+            return static_cast<int>(masterFirmware.sharedProgramByte(base + offset)
+                                    & 0x7fu);
+        };
 
-    const auto source = juce::jlimit(0, 3, byte(3));
-    const auto enabled = source != 0 && byte(13) == 0;
-    const auto midiChannel = juce::jlimit(0, 16, byte(2));
-    const auto gain = static_cast<float>(byte(4)) / 127.0f;
-    const auto pan = juce::jlimit(
-        -1.0f, 1.0f, static_cast<float>(byte(5) - 64) / 64.0f);
-    const auto panMode = juce::jlimit(0, 2, byte(6));
-    const auto auxGain = static_cast<float>(byte(7)) / 127.0f;
-    const auto audioOutput = juce::jlimit(0, 3, byte(8));
-    const auto transpose = byte(9) - 64;
-    const auto detune = static_cast<float>(byte(10) - 64);
-    const auto keyLow = byte(17);
-    const auto keyHigh = byte(18);
-    const auto velocityLow = juce::jmax(1, byte(19));
-    const auto velocityHigh = juce::jmax(1, byte(20));
-    const auto velocityTable = juce::jlimit(0, 11, byte(21));
-    const auto tuningTable = juce::jlimit(0, 12, byte(22));
+        const auto source = juce::jlimit(0, 3, byte(3));
+        const auto enabled = source != 0 && byte(13) == 0;
+        const auto midiChannel = juce::jlimit(0, 16, byte(2));
+        const auto gain = static_cast<float>(byte(4)) / 127.0f;
+        const auto pan = juce::jlimit(
+            -1.0f, 1.0f, static_cast<float>(byte(5) - 64) / 64.0f);
+        const auto panMode = juce::jlimit(0, 2, byte(6));
+        const auto auxGain = static_cast<float>(byte(7)) / 127.0f;
+        const auto audioOutput = juce::jlimit(0, 3, byte(12));
+        const auto transpose = byte(9) - 64;
+        const auto detune = static_cast<float>(byte(10) - 64);
+        const auto keyLow = byte(17);
+        const auto keyHigh = byte(18);
+        const auto velocityLow = juce::jmax(1, byte(19));
+        const auto velocityHigh = juce::jmax(1, byte(20));
+        const auto velocityTable = juce::jlimit(0, 11, byte(21));
+        const auto tuningTable = juce::jlimit(0, 12, byte(22));
+        const auto allocationMode = juce::jlimit(0, 22, byte(15));
 
-    const auto& existing
-        = current->layers[static_cast<size_t>(*firmwareInstrument)];
-    if (existing.enabled == enabled && existing.source == source
-        && existing.midiChannel == midiChannel
-        && std::abs(existing.gain - gain) <= 1.0e-6f
-        && std::abs(existing.sound.panAmount - pan) <= 1.0e-6f
-        && existing.sound.panModulationMode == panMode
-        && std::abs(existing.auxGain - auxGain) <= 1.0e-6f
-        && existing.audioOutput == audioOutput
-        && existing.transposeSemitones == transpose
-        && std::abs(existing.detuneCents - detune) <= 1.0e-6f
-        && existing.keyLow == keyLow && existing.keyHigh == keyHigh
-        && existing.velocityLow == velocityLow
-        && existing.velocityHigh == velocityHigh
-        && existing.velocityTable == velocityTable
-        && existing.tuningTable == tuningTable)
+        const auto& existing
+            = current->layers[static_cast<size_t>(instrument)];
+        if (existing.enabled == enabled && existing.source == source
+            && existing.midiChannel == midiChannel
+            && std::abs(existing.gain - gain) <= 1.0e-6f
+            && std::abs(existing.sound.panAmount - pan) <= 1.0e-6f
+            && existing.sound.panModulationMode == panMode
+            && std::abs(existing.auxGain - auxGain) <= 1.0e-6f
+            && existing.audioOutput == audioOutput
+            && existing.transposeSemitones == transpose
+            && std::abs(existing.detuneCents - detune) <= 1.0e-6f
+            && existing.keyLow == keyLow && existing.keyHigh == keyHigh
+            && existing.velocityLow == velocityLow
+            && existing.velocityHigh == velocityHigh
+            && existing.velocityTable == velocityTable
+            && existing.tuningTable == tuningTable
+            && existing.allocationMode == allocationMode)
+            continue;
+
+        if (changed == nullptr)
+            changed = std::make_shared<wave::dsp::WaldorfEngine::PerformanceSnapshot>(*current);
+        auto& layer = changed->layers[static_cast<size_t>(instrument)];
+        if (enabled && !existing.enabled)
+        {
+            if (const auto record = masterFirmware.performanceInstrumentSoundRecordOffset(instrument))
+            {
+                std::array<uint8_t, wave::presets::WaveFactorySet::soundSize> sound {};
+                for (size_t offset = 0; offset < sound.size(); ++offset)
+                    sound[offset] = masterFirmware.sharedProgramByte(
+                        *record + static_cast<uint32_t>(offset));
+                layer.sound = decodeFactorySound(sound);
+            }
+        }
+        layer.enabled = enabled;
+        layer.source = source;
+        layer.midiChannel = midiChannel;
+        layer.gain = gain;
+        layer.sound.panAmount = pan;
+        layer.sound.panModulationMode = panMode;
+        layer.auxGain = auxGain;
+        layer.audioOutput = audioOutput;
+        layer.transposeSemitones = transpose;
+        layer.detuneCents = detune;
+        layer.keyLow = keyLow;
+        layer.keyHigh = keyHigh;
+        layer.velocityLow = velocityLow;
+        layer.velocityHigh = velocityHigh;
+        layer.velocityTable = velocityTable;
+        layer.tuningTable = tuningTable;
+        layer.allocationMode = allocationMode;
+    }
+    if (changed != nullptr)
+        std::atomic_store_explicit(
+            &factoryPerformance,
+            std::static_pointer_cast<const wave::dsp::WaldorfEngine::PerformanceSnapshot>(
+                changed),
+            std::memory_order_release);
+}
+
+void WaveEmulationAudioProcessor::sendPendingGlideFadersToFirmware()
+{
+    if (panelSelectedEdit.load(std::memory_order_acquire) != 11)
+    {
+        for (auto& edit : pendingGlideFaderEdits)
+            edit.store(-1, std::memory_order_release);
         return;
-
-    auto changed
-        = std::make_shared<wave::dsp::WaldorfEngine::PerformanceSnapshot>(*current);
-    auto& layer = changed->layers[static_cast<size_t>(*firmwareInstrument)];
-    layer.enabled = enabled;
-    layer.source = source;
-    layer.midiChannel = midiChannel;
-    layer.gain = gain;
-    layer.sound.panAmount = pan;
-    layer.sound.panModulationMode = panMode;
-    layer.auxGain = auxGain;
-    layer.audioOutput = audioOutput;
-    layer.transposeSemitones = transpose;
-    layer.detuneCents = detune;
-    layer.keyLow = keyLow;
-    layer.keyHigh = keyHigh;
-    layer.velocityLow = velocityLow;
-    layer.velocityHigh = velocityHigh;
-    layer.velocityTable = velocityTable;
-    layer.tuningTable = tuningTable;
-    std::atomic_store_explicit(
-        &factoryPerformance,
-        std::static_pointer_cast<const wave::dsp::WaldorfEngine::PerformanceSnapshot>(
-            changed),
-        std::memory_order_release);
+    }
+    if (panelModeDisplayTransitionActive.load(std::memory_order_acquire)
+        || !masterFirmware.panelLed(75))
+        return;
+    const auto program = masterFirmware.currentPerformanceId();
+    const auto instrument = masterFirmware.currentPerformanceInstrument();
+    auto changed = false;
+    for (const auto fader : { 0, 1, 4, 5 })
+    {
+        const auto packed = pendingGlideFaderEdits[static_cast<size_t>(fader)].load(
+            std::memory_order_acquire);
+        if (packed < 0)
+            continue;
+        if (((packed >> 11) & 0xff) != currentProgram.load(std::memory_order_acquire))
+        {
+            pendingGlideFaderEdits[static_cast<size_t>(fader)].store(-1,
+                                                                  std::memory_order_release);
+            continue;
+        }
+        if (!program.has_value() || !instrument.has_value()
+            || *program != ((packed >> 11) & 0xff)
+            || *instrument != ((packed >> 8) & 7))
+            continue;
+        pendingGlideFaderEdits[static_cast<size_t>(fader)].store(-1,
+                                                              std::memory_order_release);
+        const auto physical = packed & 0x7f;
+        const auto offset = fader == 0 ? 233u : fader == 1 ? 235u
+                                  : fader == 4 ? 236u : 237u;
+        const auto value = fader == 0 ? 1 + physical * 6 / 128
+                         : fader == 1 ? physical * 2 / 128
+                         : fader == 4 ? physical * 39 / 128 : physical;
+        // As with Instrument Edit, model the absent ASIC's contextual
+        // analogue-to-record transfer on the audio thread. The OS owns the
+        // page, Sound destination, display, and subsequent voice commands.
+        changed |= masterFirmware.writeCurrentSoundRecordByte(
+            offset, static_cast<uint8_t>(value));
+    }
+    if (changed)
+        masterFirmware.refreshCurrentScreenFromFirmware();
 }
 
 void WaveEmulationAudioProcessor::sendPendingPanelEncodersToFirmware()
@@ -3308,6 +3691,11 @@ void WaveEmulationAudioProcessor::sendPendingPanelStepButtonsToFirmware()
 
     if (queuedPanelStepButtonEvents == 0)
         return;
+    if (masterFirmware.stepDiskMenuWithFirmware(queuedPanelStepButtonEvents > 0))
+    {
+        queuedPanelStepButtonEvents += queuedPanelStepButtonEvents < 0 ? 1 : -1;
+        return;
+    }
     activePanelStepButtonDiagnosticCode
         = queuedPanelStepButtonEvents < 0 ? 69 : 72;
     activePanelStepButtonWaitBlocks = 0;
@@ -3508,22 +3896,44 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
 {
     const auto diagnosticCode
         = wave::panel::diagnosticCodeForMatrixIndex(buttonId);
+    if (diagnosticCode == 3 || diagnosticCode == 4)
+    {
+        auto& down = panelButtonDown[static_cast<size_t>(buttonId)];
+        if (down.load(std::memory_order_acquire) == pressed)
+            return true;
+        const auto event = keyboardButtonEventFifo.write(1);
+        if (event.blockSize1 == 0)
+            return false;
+        keyboardButtonEvents[static_cast<size_t>(event.startIndex1)]
+            = static_cast<uint8_t>(((diagnosticCode - 3) << 1) | (pressed ? 1 : 0));
+        down.store(pressed, std::memory_order_release);
+        return true;
+    }
     if (pressed && (diagnosticCode == 12 || diagnosticCode == 73))
     {
         pendingKeyboardOctaveRestore.store(2, std::memory_order_release);
         keyboardOctaveRestoreWaitBlocks.store(0, std::memory_order_release);
     }
+    const auto storeCancel = diagnosticCode == 71
+        && (storeMenuActive.load(std::memory_order_acquire)
+            || storeExitModePending.load(std::memory_order_acquire));
     const auto requesterActive
         = firmwareRequesterActive.load(std::memory_order_acquire);
     const auto storeDestinationStep
         = requesterActive && storeMenuActive.load(std::memory_order_acquire)
           && (diagnosticCode == 69 || diagnosticCode == 72);
+    const auto nameCursorStep
+        = requesterActive
+          && (storeMenuActive.load(std::memory_order_acquire)
+              || firmwareDiskNameEditorActive.load(std::memory_order_acquire))
+          && (diagnosticCode == 21 || diagnosticCode == 23);
     if (pressed && requesterActive && diagnosticCode != 70
-        && diagnosticCode != 71 && !storeDestinationStep)
+        && diagnosticCode != 71 && !storeDestinationStep
+        && !nameCursorStep)
     {
         // A genuine OS requester owns the front panel until CANCEL or OK. The
-        // Store requester additionally accepts the physical -/+ contacts to
-        // choose its destination location. Reject every other contact before
+        // Store requester additionally accepts -/+ for its destination, and
+        // Store/DOS name editors accept Page arrows. Reject other contacts before
         // any local mode/edit/LED state is changed; the UI receives this
         // result as engine feedback and never infers modal state from pixels.
         if (buttonId >= 0 && buttonId < static_cast<int>(panelButtonDown.size()))
@@ -3531,6 +3941,44 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
                 false, std::memory_order_release);
         masterFirmware.setPanelButton(buttonId, false);
         return false;
+    }
+    // An open requester owns the page (handled above). Once a Store save has
+    // closed its requester, the OS accepts another operating-mode button as
+    // an exit from Store. Keep our mode and Store lamp on that same path;
+    // previously the OS changed pages but our exclusive-mode guard left the
+    // Store lamp lit and could expose the old requester over the new page.
+    constexpr std::array exclusivePageCodes { 38, 33, 35, 34, 32,
+                                              37, 36, 39, 58, 57 };
+    const auto currentMode = panelSelectedMode.load(std::memory_order_acquire);
+    const auto requestedOperatingPage
+        = std::find(exclusivePageCodes.begin(), exclusivePageCodes.end(),
+                    diagnosticCode) != exclusivePageCodes.end();
+    const auto completedStoreCanExitByMode
+        = currentMode == 57 && !requesterActive
+          && !storeExitModePending.load(std::memory_order_acquire)
+          && diagnosticCode != 57 && diagnosticCode != 35
+          && requestedOperatingPage;
+    const auto exclusiveModeOwnsSelection
+        = (currentMode == 34 || currentMode == 32
+           || currentMode == 58 || currentMode == 57)
+          && diagnosticCode != currentMode && requestedOperatingPage
+          && !completedStoreCanExitByMode;
+    if (pressed && exclusiveModeOwnsSelection)
+    {
+        if (buttonId >= 0 && buttonId < static_cast<int>(panelButtonDown.size()))
+            panelButtonDown[static_cast<size_t>(buttonId)].store(
+                false, std::memory_order_release);
+        masterFirmware.setPanelButton(buttonId, false);
+        return false;
+    }
+    if (pressed && completedStoreCanExitByMode)
+    {
+        // The saved record's page is visible, but Store still owns the native
+        // Instrument chooser. Retire it before delivering the new mode and
+        // its Instrument softkey, which would otherwise open another save.
+        storeExitMode.store(diagnosticCode, std::memory_order_release);
+        storeExitModePending.store(true, std::memory_order_release);
+        pendingPanelCancel.store(true, std::memory_order_release);
     }
     if (storeDestinationStep)
     {
@@ -3549,6 +3997,12 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
     }
     if (pressed && (diagnosticCode == 70 || diagnosticCode == 71))
     {
+        if (diagnosticCode == 70 && requesterActive
+            && storeMenuActive.load(std::memory_order_acquire))
+            storeSaveCompletionPending.store(true, std::memory_order_release);
+        else if (diagnosticCode == 71)
+            storeSaveCompletionPending.store(false, std::memory_order_release);
+
         // Once a display softkey has opened a requester, its transaction is
         // complete. CANCEL/OK must retire it so the next Zoning softkey can
         // create a fresh edge after the requester closes.
@@ -3561,18 +4015,24 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
         // selection after the OS has returned to Performance.
         const auto diskWorkspaceActive
             = diskMenuActive.load(std::memory_order_acquire);
-        const auto leavingDisk
+        const auto skippingDiskCalibration
             = diagnosticCode == 71
+              && diskSetImportConfirmationPending.load(std::memory_order_acquire)
+              && firmwareDiskCalibrationRequesterActive.load(std::memory_order_acquire);
+        if (skippingDiskCalibration)
+            pendingDiskSetBytes.store(0, std::memory_order_release);
+        const auto leavingDisk
+            = diagnosticCode == 71 && !skippingDiskCalibration
               && diskMenuActive.exchange(false, std::memory_order_acq_rel);
         const auto leavingStore
-            = storeMenuActive.load(std::memory_order_acquire);
+            = diagnosticCode == 71
+              && storeMenuActive.load(std::memory_order_acquire);
         const auto selectedMode
             = panelSelectedMode.load(std::memory_order_acquire);
         const auto diskImportAwaitingConfirmation
             = diskSetImportConfirmationPending.load(std::memory_order_acquire);
         const auto diskImportWorkspace
-            = diskWorkspaceActive || selectedMode == 34
-              || selectedMode == 32 || selectedMode == 58;
+            = !diskWorkspaceActive && (selectedMode == 34 || selectedMode == 32);
         const auto completingDiskImport
             = diagnosticCode == 70
               && diskImportAwaitingConfirmation && diskImportWorkspace;
@@ -3587,15 +4047,19 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
             returnToPerformanceAfterDiskImport.store(
                 true, std::memory_order_release);
         }
-        else if (diagnosticCode == 71)
+        else if (diagnosticCode == 71 && !skippingDiskCalibration)
         {
-            if (diskImportAwaitingConfirmation && diskImportWorkspace)
+            if (diskImportAwaitingConfirmation
+                && (diskImportWorkspace || diskWorkspaceActive))
+            {
                 diskSetImportConfirmationPending.store(
                     false, std::memory_order_release);
+                pendingDiskSetActivation.store(false, std::memory_order_release);
+            }
             returnToPerformanceAfterDiskImport.store(
                 false, std::memory_order_release);
         }
-        if ((diagnosticCode == 71
+        if ((diagnosticCode == 71 && !skippingDiskCalibration
              && (leavingDisk
                  || selectedMode == 34
                  || selectedMode == 32))
@@ -3606,34 +4070,32 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
         }
         if (leavingStore)
         {
-            // Store's requester leaves its Manager/name-selection callback
-            // installed until the next operating-page serial action.  Merely
-            // changing the engine's LED state makes '?' render every numeric
-            // candidate with the current Performance name.  Defer the real
-            // Performance contact until OK/Cancel has physically released.
-            returnToPerformanceAfterStoreExit.store(
+            // Store's Manager callbacks need a native Cancel release before
+            // returning to Performance. The audio-thread transaction supplies
+            // both edges even when the whole click falls between callbacks.
+            storeExitMode.store(39, std::memory_order_release);
+            storeExitModePending.store(
                 true, std::memory_order_release);
+            pendingPanelCancel.store(true, std::memory_order_release);
         }
 
-        // The Store requester is itself the Store page's final operation.
-        // Either response leaves that page, so its page lamp must be retired
-        // with the same firmware-facing OK/CANCEL edge.
-        storeMenuActive.store(false, std::memory_order_release);
+        if (leavingStore)
+            storeMenuActive.store(false, std::memory_order_release);
     }
     const auto schedulePerformanceAfterDiskOkRelease
         = !pressed && diagnosticCode == 70
           && returnToPerformanceAfterDiskImport.exchange(
               false, std::memory_order_acq_rel);
-    const auto schedulePerformanceAfterStoreRelease
-        = !pressed && (diagnosticCode == 70 || diagnosticCode == 71)
-          && returnToPerformanceAfterStoreExit.exchange(
-              false, std::memory_order_acq_rel);
     if (pressed && diagnosticCode != 69 && diagnosticCode != 72)
         panelWavetableDataDialActive.store(false, std::memory_order_release);
-    auto firmwareButtonEventHandled = false;
+    auto firmwareButtonEventHandled = storeCancel;
     if (buttonId >= 0 && buttonId < static_cast<int>(panelButtonDown.size()))
         panelButtonDown[static_cast<size_t>(buttonId)].store(
             pressed, std::memory_order_release);
+    if (pressed && diagnosticCode >= 45 && diagnosticCode <= 56)
+        // Repair abandoned Manager ownership on the audio thread, before the
+        // native scanner consumes this contact. Never modify OS RAM here.
+        pendingNumericPanelInput.store(true, std::memory_order_release);
     if (diagnosticCode == 6)
     {
         // The audio-thread transaction owns both edges. Queue on mouse-down;
@@ -3651,16 +4113,7 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
 
     if (pressed)
     {
-        constexpr std::array operatingModeCodes { 38, 33, 35, 34, 32,
-                                                   37, 36, 39, 58, 57 };
-        const auto selectedOperatingMode
-            = panelSelectedMode.load(std::memory_order_acquire);
-        const auto exclusiveModeOwnsSelection
-            = (selectedOperatingMode == 34 || selectedOperatingMode == 32
-               || selectedOperatingMode == 58 || selectedOperatingMode == 57)
-              && diagnosticCode != selectedOperatingMode
-              && std::find(operatingModeCodes.begin(), operatingModeCodes.end(),
-                           diagnosticCode) != operatingModeCodes.end();
+        constexpr auto operatingModeCodes = exclusivePageCodes;
         if (!exclusiveModeOwnsSelection && diagnosticCode == 58) // Disk
         {
             storeMenuActive.store(false, std::memory_order_release);
@@ -3672,6 +4125,10 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
         {
             diskMenuActive.store(false, std::memory_order_release);
             storeMenuActive.store(true, std::memory_order_release);
+            if (currentMode != 57)
+                storeReturnMode.store(currentMode, std::memory_order_release);
+            completedStoreMode.store(-1, std::memory_order_release);
+            storeSaveCompletionPending.store(false, std::memory_order_release);
             panelSelectedMode.store(57, std::memory_order_release);
             panelSelectedEdit.store(-1, std::memory_order_release);
         }
@@ -3769,9 +4226,11 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
         const auto instrument = std::find(instrumentCodes.begin(),
                                           instrumentCodes.end(),
                                           diagnosticCode);
-        if (performanceMode && hasPerformanceSet && diagnosticCode == 24)
+        const auto instrumentControlsActive
+            = performanceMode || selectedPanelMode == 36;
+        if (instrumentControlsActive && hasPerformanceSet && diagnosticCode == 24)
             togglePerformanceMuteMode();
-        else if (performanceMode && hasPerformanceSet && diagnosticCode == 78)
+        else if (instrumentControlsActive && hasPerformanceSet && diagnosticCode == 78)
             togglePerformanceSoloMode();
         else if (selectedPanelMode == 36 && hasPerformanceSet
                  && instrument != instrumentCodes.end())
@@ -3808,6 +4267,18 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
                         pendingInstrumentPageSelection.store(
                             selectedInstrument, std::memory_order_release);
                     }
+                }
+                else
+                {
+                    // An OFF Instrument must still reach the OS: its Source
+                    // fader is how the Wave activates it. The engine will
+                    // mirror the native record after Source is changed.
+                    cancelInstrumentPageSelection.store(
+                        true, std::memory_order_release);
+                    cancelActiveInstrumentSelection.store(
+                        true, std::memory_order_release);
+                    pendingFirmwareInstrument.store(
+                        selectedInstrument, std::memory_order_release);
                 }
             }
         }
@@ -3865,7 +4336,6 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
             panelSelectedEdit.store(-1, std::memory_order_release);
             if (diagnosticCode == 36)
             {
-                instrumentEditPage.store(0, std::memory_order_release);
                 instrumentPageReady.store(false, std::memory_order_release);
                 startInstrumentPageSelectionDelay.store(
                     true, std::memory_order_release);
@@ -3920,8 +4390,9 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
                                                    std::memory_order_release);
             panelModeDisplayAwaitingDispatch.store(true,
                                                   std::memory_order_release);
-            pendingFirmwareModeButton.store(diagnosticCode,
-                                            std::memory_order_release);
+            if (!storeExitModePending.load(std::memory_order_acquire))
+                pendingFirmwareModeButton.store(diagnosticCode,
+                                                std::memory_order_release);
         }
         if (diagnosticCode == 21 || diagnosticCode == 23)
         {
@@ -3930,14 +4401,6 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
             firmwareButtonEventHandled = true;
             pendingFirmwarePageButton.store(diagnosticCode,
                                             std::memory_order_release);
-            if (panelSelectedMode.load(std::memory_order_acquire) == 36)
-            {
-                const auto page = instrumentEditPage.load(
-                    std::memory_order_acquire);
-                instrumentEditPage.store(
-                    (page + (diagnosticCode == 23 ? 1 : 3)) % 4,
-                    std::memory_order_release);
-            }
         }
     }
     if (firmwareButtonEventHandled)
@@ -3945,7 +4408,9 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
     else if ((diagnosticCode == 69 || diagnosticCode == 72) && pressed)
     {
         const auto performancePage
-            = panelSelectedMode.load(std::memory_order_acquire) == 39
+            = (panelSelectedMode.load(std::memory_order_acquire) == 39
+               || (storeMenuActive.load(std::memory_order_acquire)
+                   && completedStoreMode.load(std::memory_order_acquire) == 39))
               && panelSelectedEdit.load(std::memory_order_acquire) < 0;
         if (performancePage)
         {
@@ -3988,8 +4453,7 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
     }
     else if (diagnosticCode != 69 && diagnosticCode != 72)
         masterFirmware.setPanelButton(buttonId, pressed);
-    if (schedulePerformanceAfterDiskOkRelease
-        || schedulePerformanceAfterStoreRelease)
+    if (schedulePerformanceAfterDiskOkRelease)
     {
         // The unavailable panel/disk glue returns the operating page after
         // Total Recall. Queue the genuine Performance serial contact only
@@ -4056,13 +4520,9 @@ int WaveEmulationAudioProcessor::getFirmwareOscillatorOctave(int oscillator) con
 {
     if (oscillator < 0 || oscillator >= 2)
         return 0;
-    // The engine owns the selected layer's five-position octave state. The
-    // current firmware runtime does not yet model the CPU board's periodic LED
-    // scan, so its output latch can retain an octave LED from the previously
-    // selected Instrument. Treating that stale lamp as parameter feedback
-    // changes the new layer's pitch merely by selecting it. The panel LEDs
-    // below are therefore driven from this engine state, while an actual
-    // Octave-button edge updates the same state in setPanelButton().
+    // This mirror is refreshed from the selected firmware Sound record, whose
+    // octave bytes are also used by the DSP. The panel's serial LED latch can
+    // retain a previous Instrument's lamp and is not parameter feedback.
     return panelOscillatorOctaves[static_cast<size_t>(oscillator)].load(
         std::memory_order_acquire);
 }
@@ -4105,6 +4565,18 @@ void WaveEmulationAudioProcessor::setPanelFader(int faderIndex, int controlId,
     masterFirmware.setPanelAnalog(controlId, value);
     if (!performanceMode)
     {
+        if (panelSelectedEdit.load(std::memory_order_acquire) == 11
+            && (faderIndex == 0 || faderIndex == 1
+                || faderIndex == 4 || faderIndex == 5))
+        {
+            const auto instrument = getSelectedPerformanceInstrument();
+            const auto program = currentProgram.load(std::memory_order_acquire);
+            if (instrument >= 0 && instrument < 8 && program >= 0 && program < 256)
+                pendingGlideFaderEdits[static_cast<size_t>(faderIndex)].store(
+                    (program << 11) | (instrument << 8) | juce::roundToInt(value * 127.0f),
+                    std::memory_order_release);
+            return;
+        }
         if (panelSelectedMode.load(std::memory_order_acquire) == 36
             && panelSelectedEdit.load(std::memory_order_acquire) < 0
             && instrumentEditPage.load(std::memory_order_acquire) <= 1
@@ -4116,8 +4588,9 @@ void WaveEmulationAudioProcessor::setPanelFader(int faderIndex, int controlId,
             if (instrument >= 0 && instrument < 8 && program >= 0 && program < 256)
             {
                 const auto physical = juce::roundToInt(value * 127.0f);
+                const auto adc = juce::roundToInt(value * 255.0f);
                 pendingInstrumentFaderEdits[static_cast<size_t>(faderIndex)].store(
-                    (page << 19) | (program << 11) | (instrument << 8)
+                    (adc << 21) | (page << 19) | (program << 11) | (instrument << 8)
                         | physical,
                     std::memory_order_release);
             }
@@ -4349,10 +4822,14 @@ bool WaveEmulationAudioProcessor::getPanelLed(int ledId) const noexcept
     // bank first can illuminate both the old and newly requested modes.
     constexpr std::array modeCodes { 38, 33, 35, 34, 32, 37, 36, 39 };
     constexpr std::array modeLeds { 64, 69, 21, 74, 26, 10, 22, 51 };
+    auto lampMode = panelSelectedMode.load(std::memory_order_acquire);
+    if (storeMenuActive.load(std::memory_order_acquire))
+        if (const auto completed = completedStoreMode.load(std::memory_order_acquire);
+            completed >= 0)
+            lampMode = completed;
     for (size_t index = 0; index < modeCodes.size(); ++index)
         if (ledId == modeLeds[index])
-            return panelSelectedMode.load(std::memory_order_acquire)
-                   == modeCodes[index];
+            return lampMode == modeCodes[index];
 
     // An Edit overlay has exactly one selected section. The 6522 output banks
     // are written independently and the raw firmware latch can briefly retain
@@ -4422,13 +4899,14 @@ bool WaveEmulationAudioProcessor::getPanelLed(int ledId) const noexcept
         return (currentProgram.load(std::memory_order_acquire) / 128 == 1)
                == (ledId == 85);
 
-    // Disk and Store are full operating-mode lamps, not contact lamps. Their
-    // physical switches are momentary, but each indicator remains asserted
-    // exclusively until its firmware workspace is exited.
+    // Disk stays lit while its workspace is active. Store gives way to the
+    // preceding operating-mode lamp after a successful save, while the
+    // native chooser remains available for another record.
     if (ledId == 52)
         return diskMenuActive.load(std::memory_order_acquire);
     if (ledId == 87)
-        return storeMenuActive.load(std::memory_order_acquire);
+        return storeMenuActive.load(std::memory_order_acquire)
+               && completedStoreMode.load(std::memory_order_acquire) < 0;
 
     struct MomentaryLed
     {
@@ -4524,6 +5002,13 @@ void WaveEmulationAudioProcessor::getStateInformation(juce::MemoryBlock& destina
     // lock. The firmware, disk and calibration state must remain one snapshot.
     const juce::ScopedLock callbackLock(getCallbackLock());
     auto state = parameters.copyState();
+    state.removeProperty("ecoMode", nullptr);
+    // These are regenerated from the current machine. copyState() may still
+    // contain snapshots from an earlier project or a previously loaded disk.
+    for (const auto* key : { "machineActiveSetData", "machineDiskImageData",
+                             "machineDiskImageName", "mountedDiskImage",
+                             "machinePerformanceSnapshot", "machineFirmwareEditBuffers" })
+        state.removeProperty(key, nullptr);
     state.setProperty("machineStateSchema", machineStateSchemaVersion, nullptr);
     state.setProperty("factoryProgram",
                       currentProgram.load(std::memory_order_acquire), nullptr);
@@ -4549,12 +5034,31 @@ void WaveEmulationAudioProcessor::getStateInformation(juce::MemoryBlock& destina
                       activeSet != nullptr && activeSet->isLoaded(), nullptr);
     if (activeSet != nullptr && activeSet->isLoaded()
         && !activeSet->sourceImage().isEmpty())
+    {
+        auto setImage = activeSet->sourceImage();
+        if (masterFirmware.isLoaded()
+            && !pendingDiskSetActivation.load(std::memory_order_acquire))
+        {
+            // Store changes native SRAM, not the imported SET. Persist both
+            // complete banks alongside the separate current edit buffers.
+            std::vector<uint8_t> sounds(activeSet->soundBank().size());
+            std::vector<uint8_t> performances(activeSet->performanceBank().size());
+            for (size_t byte = 0; byte < sounds.size(); ++byte)
+                sounds[byte] = masterFirmware.sharedProgramByte(
+                    0x18000u + static_cast<uint32_t>(byte));
+            for (size_t byte = 0; byte < performances.size(); ++byte)
+                performances[byte] = masterFirmware.sharedProgramByte(
+                    0x28000u + static_cast<uint32_t>(byte));
+            setImage = activeSet->imageWithStoredBanks(sounds, performances);
+        }
         state.setProperty("machineActiveSetData",
-                          juce::var(activeSet->sourceImage()), nullptr);
+                          juce::var(setImage), nullptr);
+    }
 
     auto persistentPerformance = std::atomic_load_explicit(
         &factoryPerformance, std::memory_order_acquire);
-    if (persistentPerformance != nullptr)
+    if (persistentPerformance != nullptr
+        && !pendingDiskSetActivation.load(std::memory_order_acquire))
     {
         auto exactPerformance = *persistentPerformance;
         const auto editable = exactPerformance.editableLayer;
@@ -4618,7 +5122,8 @@ void WaveEmulationAudioProcessor::getStateInformation(juce::MemoryBlock& destina
             editBuffers = std::static_pointer_cast<const HostMachineSnapshot>(fallback);
         }
     }
-    if (editBuffers != nullptr)
+    if (editBuffers != nullptr && activeSet != nullptr && activeSet->isLoaded()
+        && !pendingDiskSetActivation.load(std::memory_order_acquire))
     {
         juce::MemoryBlock binary;
         juce::MemoryOutputStream stream(binary, false);
@@ -4687,7 +5192,17 @@ void WaveEmulationAudioProcessor::setStateInformation(const void* data, int size
     {
         if (xml->hasTagName(parameters.state.getType()))
         {
-            const auto restoredState = juce::ValueTree::fromXml(*xml);
+            auto restoredState = juce::ValueTree::fromXml(*xml);
+            // Retired reduced-rate Eco settings must not degrade recalled audio.
+            restoredState.removeProperty("ecoMode", nullptr);
+            // Edit buffers belong to the incoming project, not the instance's
+            // previously selected disk or Performance with the same number.
+            std::atomic_store_explicit(&latestFirmwareSelectedSound,
+                std::shared_ptr<const FirmwareSelectedSoundState>{}, std::memory_order_release);
+            std::atomic_store_explicit(&latestHostMachineSnapshot,
+                std::shared_ptr<const HostMachineSnapshot>{}, std::memory_order_release);
+            std::atomic_store_explicit(&pendingHostMachineRestore,
+                std::shared_ptr<const HostMachineSnapshot>{}, std::memory_order_release);
             const auto exactMachineState
                 = static_cast<int>(restoredState.getProperty(
                       "machineStateSchema", 0)) == machineStateSchemaVersion;
@@ -4701,18 +5216,20 @@ void WaveEmulationAudioProcessor::setStateInformation(const void* data, int size
             const auto activeSetData = restoredState.getProperty("machineActiveSetData");
             if (exactMachineState)
             {
-                if (const auto* bytes = activeSetData.getBinaryData(); bytes != nullptr)
+                const auto hasActiveSet = static_cast<bool>(restoredState.getProperty(
+                    "machineHasActiveSet", true));
+                if (const auto* bytes = activeSetData.getBinaryData();
+                    hasActiveSet && bytes != nullptr)
                 {
                     auto set = std::make_shared<wave::presets::WaveFactorySet>();
-                    if (set->load(*bytes).validLayout)
+                    if (set->loadStateSnapshot(*bytes).validLayout)
                         restoredExactSet = std::static_pointer_cast<
                             const wave::presets::WaveFactorySet>(set);
                 }
                 if (restoredExactSet != nullptr)
                     setActivePerformanceSet(restoredExactSet);
-                else if (!static_cast<bool>(restoredState.getProperty(
-                             "machineHasActiveSet", true)))
-                    setActivePerformanceSet(nullptr);
+                else if (!hasActiveSet)
+                    resetToColdStart();
             }
 
             parameters.replaceState(restoredState.createCopy());
@@ -4733,7 +5250,14 @@ void WaveEmulationAudioProcessor::setStateInformation(const void* data, int size
                 if (!report.hasBothImages() && !loadRememberedFirmware())
                     loadEmbeddedPrivateRoms();
             }
+            // Embedded-firmware sessions can restore without rebooting.
+            // Reinstall the native bank even if this instance previously
+            // imported a PPG image, then resolve this SET's user references.
+            if (engine.loadWaveFactoryRom(firmware.getMasterImage())
+                && restoredSet != nullptr)
+                engine.loadWaveSetUserTables(restoredSet->sourceImage());
             removeRestoredHostStateDisk();
+            (void) masterFirmware.ejectDiskImage();
             auto restoredEmbeddedDisk = false;
             const auto diskData = restoredState.getProperty("machineDiskImageData");
             if (exactMachineState)
@@ -4776,12 +5300,18 @@ void WaveEmulationAudioProcessor::setStateInformation(const void* data, int size
             if (restoredExactSet != nullptr)
                 setActivePerformanceSet(restoredExactSet);
             pendingDiskSetActivation.store(false, std::memory_order_release);
+            pendingManagerExitProgram.store(-1, std::memory_order_release);
             pendingDiskSetBytes.store(0, std::memory_order_release);
             diskSetImportConfirmationPending.store(
                 false, std::memory_order_release);
             const auto set = currentPerformanceSet();
             if (set != nullptr && set->isLoaded())
             {
+                // Embedded firmware may already be running, so restoring a
+                // SET does not necessarily reboot through startLoadedFirmware.
+                // Install the full banks before selecting the saved program.
+                masterFirmware.installSoundBank(set->soundBank());
+                masterFirmware.installPerformanceBank(set->performanceBank());
                 // Reconstruct all eight factory Performance elements, then restore
                 // current-version edits over that template. Older standalone state
                 // predates complete Performance layering and may contain a stale pan
@@ -4999,6 +5529,9 @@ wave::firmware::Bundle::Report WaveEmulationAudioProcessor::loadFirmware(
         return report;
     firmware = std::move(candidate);
     report = startLoadedFirmware(report, true);
+    if (currentPerformanceSet() != nullptr)
+        pendingFirmwareProgram.store(currentProgram.load(std::memory_order_acquire),
+                                     std::memory_order_release);
     if (rememberForNewInstances)
     {
         const auto created = firmwarePreferenceFile.getParentDirectory().createDirectory();
@@ -5014,6 +5547,9 @@ wave::firmware::Bundle::Report WaveEmulationAudioProcessor::startLoadedFirmware(
 {
     if (report.hasBothImages())
     {
+        // The Wave's own factory routines supersede the PPG fallback and
+        // previously remembered PPG imports on every firmware/state reload.
+        engine.loadWaveFactoryRom(firmware.getMasterImage());
         sharedFirmwareMemory.clear();
         if (rememberDirectory && firmware.getDirectory().isDirectory())
             parameters.state.setProperty("firmwareDirectory",
@@ -5075,9 +5611,16 @@ wave::firmware::Bundle::Report WaveEmulationAudioProcessor::startLoadedFirmware(
                 }
             }
         }
-        if (firmware.getDirectory().isDirectory())
+        if (!engine.getWavetableBank().hasOriginalWaveFactoryTables()
+            && firmware.getDirectory().isDirectory())
             discoverWavetableRom(firmware.getDirectory());
         seedFilterCalibrationTable();
+        if (const auto set = currentPerformanceSet(); set != nullptr)
+        {
+            engine.loadWaveSetUserTables(set->sourceImage());
+            masterFirmware.installSoundBank(set->soundBank());
+            masterFirmware.installPerformanceBank(set->performanceBank());
+        }
     }
     return report;
 }
@@ -5090,9 +5633,10 @@ void WaveEmulationAudioProcessor::loadEmbeddedPrivateRoms()
     const juce::MemoryBlock voice(WaveAssets::wdv_sys,
                                   static_cast<size_t>(WaveAssets::wdv_sysSize));
     startLoadedFirmware(firmware.loadImages(master, voice), false);
-    engine.loadWavetableRom(juce::MemoryBlock(
-        WaveAssets::ppgwave2_3v6wavetables_rom,
-        static_cast<size_t>(WaveAssets::ppgwave2_3v6wavetables_romSize)));
+    if (!engine.getWavetableBank().hasOriginalWaveFactoryTables())
+        engine.loadWavetableRom(juce::MemoryBlock(
+            WaveAssets::ppgwave2_3v6wavetables_rom,
+            static_cast<size_t>(WaveAssets::ppgwave2_3v6wavetables_romSize)));
     if (const auto set = currentPerformanceSet())
         engine.loadWaveSetUserTables(set->sourceImage());
 #endif
@@ -5153,7 +5697,12 @@ bool WaveEmulationAudioProcessor::installFactoryEditRecords(int programIndex) no
         {
         }
     if (instrument >= 8)
-        return false;
+    {
+        // Empty/quarantined slots still need a native recall. Leaving the
+        // previous edit records installed keeps both its LCD and Sound live.
+        const std::array<uint8_t, wave::presets::WaveFactorySet::soundSize> emptySound{};
+        return masterFirmware.installEditRecords(emptySound, performance);
+    }
 
     const auto offset = static_cast<size_t>(64 + instrument * 32);
     const auto sound = set->sound(performance[offset + 1], performance[offset]);
@@ -5186,7 +5735,25 @@ void WaveEmulationAudioProcessor::applyFactoryProgram(int index, bool notifyFirm
         }
     }
     if (instrument == 8)
+    {
+        auto emptyPerformance
+            = std::make_shared<wave::dsp::WaldorfEngine::PerformanceSnapshot>();
+        emptyPerformance->editableLayer = -1;
+        auto emptySeed = std::make_shared<PerformanceInstrumentSoundSeed>();
+        emptySeed->performance = index;
+        std::atomic_store_explicit(
+            &factoryPerformance,
+            std::static_pointer_cast<const wave::dsp::WaldorfEngine::PerformanceSnapshot>(
+                emptyPerformance), std::memory_order_release);
+        std::atomic_store_explicit(
+            &instrumentSoundSeed,
+            std::static_pointer_cast<const PerformanceInstrumentSoundSeed>(emptySeed),
+            std::memory_order_release);
+        modulationRoutingResetPending.store(true, std::memory_order_release);
+        if (notifyFirmware && masterFirmware.isLoaded())
+            pendingFirmwareProgram.store(index, std::memory_order_release);
         return;
+    }
     instrumentOffset = static_cast<size_t>(64 + instrument * 32);
 
     const auto soundBank = static_cast<int>(performance[instrumentOffset + 1]);
@@ -5412,7 +5979,7 @@ void WaveEmulationAudioProcessor::applyFactoryProgram(int index, bool notifyFirm
         destination.auxGain
             = static_cast<float>(sevenBit(performance[layerOffset + 7])) / 127.0f;
         destination.audioOutput
-            = juce::jlimit(0, 3, sevenBit(performance[layerOffset + 8]));
+            = juce::jlimit(0, 3, sevenBit(performance[layerOffset + 12]));
         destination.keyLow = sevenBit(performance[layerOffset + 17]);
         destination.keyHigh = sevenBit(performance[layerOffset + 18]);
         destination.velocityLow = juce::jmax(1, sevenBit(performance[layerOffset + 19]));
@@ -5421,6 +5988,8 @@ void WaveEmulationAudioProcessor::applyFactoryProgram(int index, bool notifyFirm
             0, 11, sevenBit(performance[layerOffset + 21]));
         destination.tuningTable = juce::jlimit(
             0, 12, sevenBit(performance[layerOffset + 22]));
+        destination.allocationMode = juce::jlimit(
+            0, 22, sevenBit(performance[layerOffset + 15]));
         const auto nativeSound = set->sound(
             sevenBit(performance[layerOffset + 1]),
             sevenBit(performance[layerOffset]));
@@ -5536,4 +6105,35 @@ juce::File WaveEmulationAudioProcessor::getFirmwareDirectory() const noexcept
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new WaveEmulationAudioProcessor();
+}
+
+// UI artwork is a per-user preference, independent of firmware and host audio state.
+juce::File WaveEmulationAudioProcessor::getRememberedPanelSkin() const
+{
+    const auto preference = firmwarePreferenceFile.getSiblingFile(
+        firmwarePreferenceFile.getFileNameWithoutExtension() + "-panel-skin.txt");
+    const auto path = preference.loadFileAsString().trim();
+    return juce::File::isAbsolutePath(path) ? juce::File(path) : juce::File{};
+}
+
+bool WaveEmulationAudioProcessor::getRememberedCompactPanelSkin() const
+{
+    return firmwarePreferenceFile.getSiblingFile(
+        firmwarePreferenceFile.getFileNameWithoutExtension() + "-panel-skin.txt")
+        .loadFileAsString().trim() == "compact";
+}
+
+juce::Result WaveEmulationAudioProcessor::rememberPanelSkin(const juce::File& file,
+                                                           bool compact)
+{
+    const auto preference = firmwarePreferenceFile.getSiblingFile(
+        firmwarePreferenceFile.getFileNameWithoutExtension() + "-panel-skin.txt");
+    const auto created = preference.getParentDirectory().createDirectory();
+    if (created.failed())
+        return created;
+    if (!preference.replaceWithText(compact ? juce::String("compact")
+                                           : file == juce::File{} ? juce::String{}
+                                                                  : file.getFullPathName()))
+        return juce::Result::fail("Could not save the panel skin preference.");
+    return juce::Result::ok();
 }

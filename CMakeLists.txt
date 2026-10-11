@@ -6,13 +6,20 @@ if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
         "Minimum supported macOS version" FORCE)
 endif()
 
-project(WaveEmulationSample VERSION 0.1.6 LANGUAGES C CXX)
+project(WaveEmulationSample VERSION 0.1.13 LANGUAGES C CXX)
 
 include(FetchContent)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Keep Windows downloads self-contained, including the standalone executable.
+# Apply the same CRT choice to JUCE, Musashi, plugins and tests.
+if(MSVC AND NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        CACHE STRING "MSVC runtime library")
+endif()
 
 option(WAVE_BUILD_TESTS "Build deterministic DSP and firmware tests" ON)
 
@@ -33,6 +40,8 @@ FetchContent_Declare(
     GIT_TAG 8.0.15
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(JUCE)
+include(cmake/PrepareJuce.cmake)
+wave_prepare_juce("${juce_SOURCE_DIR}")
 
 FetchContent_Declare(
     Musashi
@@ -83,7 +92,9 @@ target_compile_definitions(WaveM68k PRIVATE
     M68K_INSTRUCTION_HOOK=1)
 
 set(WAVE_ASSET_SOURCES
+    data/BlankWave.img
     media/WaldorfWaveUI_NOLOGO.svg
+    media/WaldorfWaveUI_Compact.svg
     media/Slider.svg
     media/Knob1.svg
     media/Knob_red1.svg
@@ -138,10 +149,13 @@ set(WAVE_CORE_SOURCES
     Source/Dsp/DspMath.h
     Source/Dsp/Cem3387.cpp
     Source/Dsp/Cem3387.h
+    Source/Dsp/Cem3387Transfer.h
     Source/Dsp/ReferenceComparator.cpp
     Source/Dsp/ReferenceComparator.h
     Source/Dsp/PpgWaveRom.cpp
     Source/Dsp/PpgWaveRom.h
+    Source/Dsp/WaveFactoryRom.cpp
+    Source/Dsp/WaveFactoryRom.h
     Source/Dsp/WaldorfAsic.cpp
     Source/Dsp/WaldorfAsic.h
     Source/Dsp/WaldorfEngine.cpp
@@ -179,6 +193,8 @@ set(WAVE_CORE_SOURCES
     Source/WaveParameters.h)
 
 add_library(WaveCore STATIC ${WAVE_CORE_SOURCES})
+# Both libraries contain thread-local state and are linked into shared plugins.
+set_target_properties(WaveCore WaveM68k PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(WaveCore PUBLIC Source)
 target_link_libraries(WaveCore
     PUBLIC
@@ -209,10 +225,30 @@ target_include_directories(DecodePpgWavetables PRIVATE Source)
 add_executable(CreateWaveDisk EXCLUDE_FROM_ALL Tools/CreateWaveDisk.cpp)
 target_link_libraries(CreateWaveDisk PRIVATE WaveCore juce::juce_recommended_config_flags)
 
+add_executable(ProbeWaveFilter EXCLUDE_FROM_ALL Tools/ProbeWaveFilter.cpp)
+target_link_libraries(ProbeWaveFilter PRIVATE WaveCore juce::juce_recommended_config_flags)
+
+add_executable(DecodeWaveFactoryWavetables EXCLUDE_FROM_ALL Tools/DecodeWaveFactoryWavetables.cpp)
+target_link_libraries(DecodeWaveFactoryWavetables PRIVATE WaveCore juce::juce_recommended_config_flags)
+
 if(MSVC)
     target_compile_options(WaveCore PRIVATE /W4 /permissive-)
 else()
     target_compile_options(WaveCore PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endif()
+
+if(APPLE)
+    set(WAVE_PLUGIN_FORMATS AU VST3 AAX Standalone)
+else()
+    set(WAVE_PLUGIN_FORMATS VST3 Standalone)
+endif()
+
+# JUCE's manifest helper is executed directly after linking and cannot run on
+# the build host during Windows cross-compilation. VST3 hosts can scan the
+# bundle without this optional JSON manifest.
+set(WAVE_VST3_AUTO_MANIFEST TRUE)
+if(CMAKE_CROSSCOMPILING)
+    set(WAVE_VST3_AUTO_MANIFEST FALSE)
 endif()
 
 juce_add_plugin(WaveEmulation
@@ -220,7 +256,7 @@ juce_add_plugin(WaveEmulation
     BUNDLE_ID "com.DJW.WaveEmulation"
     PLUGIN_MANUFACTURER_CODE Djwh
     PLUGIN_CODE WvSm
-    FORMATS AU VST3 AAX Standalone
+    FORMATS ${WAVE_PLUGIN_FORMATS}
     PRODUCT_NAME "Wave Emulation"
     DESCRIPTION "Firmware-aware Waldorf Wave hardware modelling research sample"
     AAX_CATEGORY AAX_ePlugInCategory_SWGenerators
@@ -229,6 +265,7 @@ juce_add_plugin(WaveEmulation
     NEEDS_MIDI_OUTPUT FALSE
     IS_MIDI_EFFECT FALSE
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE
+    VST3_AUTO_MANIFEST ${WAVE_VST3_AUTO_MANIFEST}
     COPY_PLUGIN_AFTER_BUILD FALSE)
 
 target_sources(WaveEmulation PRIVATE
