@@ -106,14 +106,16 @@ find_signing_identities() {
   : "${TEAM_ID:?Set TEAM_ID for release signing, or use SKIP_SIGN=1}"
 
   if [ -z "${CODESIGN_IDENTITY:-}" ]; then
+    # Use the SHA-1 fingerprint, not the name: names with non-ASCII letters
+    # (e.g. Polish diacritics) get mangled and are then "not found".
     CODESIGN_IDENTITY="$(security find-identity -v -p codesigning |
       grep "Developer ID Application" | grep "$TEAM_ID" | head -1 |
-      sed -E 's/.*"([^"]+)".*/\1/' || true)"
+      awk '{print $2}' || true)"
   fi
   if [ -z "${INSTALLER_IDENTITY:-}" ]; then
     INSTALLER_IDENTITY="$(security find-identity -v |
       grep "Developer ID Installer" | grep "$TEAM_ID" | head -1 |
-      sed -E 's/.*"([^"]+)".*/\1/' || true)"
+      awk '{print $2}' || true)"
   fi
 
   if [ -z "$CODESIGN_IDENTITY" ] || [ -z "$INSTALLER_IDENTITY" ]; then
