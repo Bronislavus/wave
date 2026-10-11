@@ -85,6 +85,13 @@ NOTARIZE_APPLE_ID="${NOTARIZE_APPLE_ID:-${APPLE_ID:-}}"
 NOTARIZE_PASSWORD="${NOTARIZE_PASSWORD:-${APP_SPECIFIC_PASSWORD:-}}"
 NOTARIZE_TEAM_ID="${NOTARIZE_TEAM_ID:-$TEAM_ID}"
 NOTARIZE_DMG="${NOTARIZE_DMG:-1}"
+# An AAX bundle that is not PACE-wrapped will not load in Pro Tools and cannot
+# pass notarization unsigned, so it is left out of the installer by default.
+if is_truthy "${SKIP_WRAP:-}"; then
+  INCLUDE_AAX="${INCLUDE_AAX:-0}"
+else
+  INCLUDE_AAX="${INCLUDE_AAX:-1}"
+fi
 
 FINAL_PKG_NAME="${FINAL_PKG_NAME:-DJW $PRODUCT_NAME Installer $RELEASE_LABEL.pkg}"
 FINAL_DMG_NAME="${FINAL_DMG_NAME:-DJW $PRODUCT_NAME $RELEASE_LABEL.dmg}"
@@ -277,8 +284,10 @@ stage_plugins() {
     "$STAGING_DIR/au/Library/Audio/Plug-Ins/Components/$AU_NAME"
   /usr/bin/ditto --noextattr --norsrc "$VST3_SOURCE" \
     "$STAGING_DIR/vst3/Library/Audio/Plug-Ins/VST3/$VST3_NAME"
-  /usr/bin/ditto --noextattr --norsrc "$AAX_SOURCE" \
-    "$STAGING_DIR/aax/Library/Application Support/Avid/Audio/Plug-Ins/$AAX_NAME"
+  if is_truthy "$INCLUDE_AAX"; then
+    /usr/bin/ditto --noextattr --norsrc "$AAX_SOURCE" \
+      "$STAGING_DIR/aax/Library/Application Support/Avid/Audio/Plug-Ins/$AAX_NAME"
+  fi
 
   local notices="$STAGING_DIR/standalone/Library/Application Support/DJW/Wave Emulation"
   mkdir -p "$notices"
@@ -352,8 +361,15 @@ build_packages() {
     "$PACKAGES_DIR/WaveEmulation_AU.pkg"
   build_component_package "$STAGING_DIR/vst3" "$PRODUCT_IDENTIFIER.vst3" \
     "$PACKAGES_DIR/WaveEmulation_VST3.pkg"
-  build_component_package "$STAGING_DIR/aax" "$PRODUCT_IDENTIFIER.aax" \
-    "$PACKAGES_DIR/WaveEmulation_AAX.pkg"
+  local aax_outline="" aax_choice="" aax_ref="" formats="AU and VST3"
+  if is_truthy "$INCLUDE_AAX"; then
+    build_component_package "$STAGING_DIR/aax" "$PRODUCT_IDENTIFIER.aax" \
+      "$PACKAGES_DIR/WaveEmulation_AAX.pkg"
+    aax_outline='<line choice="aax"/>'
+    aax_choice="<choice id=\"aax\" title=\"AAX\"><pkg-ref id=\"$PRODUCT_IDENTIFIER.aax\"/></choice>"
+    aax_ref="<pkg-ref id=\"$PRODUCT_IDENTIFIER.aax\" version=\"$VERSION\">WaveEmulation_AAX.pkg</pkg-ref>"
+    formats="AU, VST3 and AAX"
+  fi
 
   MODIFIED_BY="${MODIFIED_BY:-Bronisław Hońca}"
   MODIFIED_DATE="${MODIFIED_DATE:-2026-10-11}"
@@ -362,7 +378,7 @@ build_packages() {
 <!doctype html><html><head><meta charset="utf-8"></head>
 <body style="font-family:-apple-system,Helvetica Neue,sans-serif;padding:20px;font-size:13px">
 <h1 style="font-size:20px">$PRODUCT_NAME <span style="font-weight:normal;color:#666">$RELEASE_LABEL</span></h1>
-<p>This installer provides the Wave Emulation standalone app in /Applications, plus AU, VST3 and AAX instrument formats.</p>
+<p>This installer provides the Wave Emulation standalone app in /Applications, plus $formats instrument formats.</p>
 <h2 style="font-size:14px">Authors</h2>
 <p>Original software: <b>Wave Emulation</b> &copy; 2026 Dave Whiting
 (<a href="https://github.com/mo0kid/wave">github.com/mo0kid/wave</a>).</p>
@@ -395,16 +411,16 @@ WELCOME
   <options customize="allow" require-scripts="false" hostArchitectures="arm64,x86_64"/>
   <volume-check><allowed-os-versions><os-version min="$CMAKE_OSX_DEPLOYMENT_TARGET"/></allowed-os-versions></volume-check>
   <choices-outline>
-    <line choice="standalone"/><line choice="au"/><line choice="vst3"/><line choice="aax"/>
+    <line choice="standalone"/><line choice="au"/><line choice="vst3"/>$aax_outline
   </choices-outline>
   <choice id="standalone" title="Standalone Application"><pkg-ref id="$PRODUCT_IDENTIFIER.standalone"/></choice>
   <choice id="au" title="Audio Unit"><pkg-ref id="$PRODUCT_IDENTIFIER.au"/></choice>
   <choice id="vst3" title="VST3"><pkg-ref id="$PRODUCT_IDENTIFIER.vst3"/></choice>
-  <choice id="aax" title="AAX"><pkg-ref id="$PRODUCT_IDENTIFIER.aax"/></choice>
+  $aax_choice
   <pkg-ref id="$PRODUCT_IDENTIFIER.standalone" version="$VERSION">WaveEmulation_Standalone.pkg</pkg-ref>
   <pkg-ref id="$PRODUCT_IDENTIFIER.au" version="$VERSION">WaveEmulation_AU.pkg</pkg-ref>
   <pkg-ref id="$PRODUCT_IDENTIFIER.vst3" version="$VERSION">WaveEmulation_VST3.pkg</pkg-ref>
-  <pkg-ref id="$PRODUCT_IDENTIFIER.aax" version="$VERSION">WaveEmulation_AAX.pkg</pkg-ref>
+  $aax_ref
 </installer-gui-script>
 DISTRIBUTION
 
@@ -532,8 +548,10 @@ build_plugins
 validate_bundle "$APP_SOURCE"
 validate_bundle "$AU_SOURCE"
 validate_bundle "$VST3_SOURCE"
-validate_bundle "$AAX_SOURCE"
-wrap_aax
+if is_truthy "$INCLUDE_AAX"; then
+  validate_bundle "$AAX_SOURCE"
+  wrap_aax
+fi
 stage_plugins
 sign_staged_plugins
 build_packages
